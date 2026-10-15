@@ -1,0 +1,108 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mmis1000 <mmis10002@gmail.com>
+Date: Fri, 16 Oct 2026 02:15:21 +0800
+Subject: [PATCH 7/7] Terminal lifetime commands in the terminal editor tab
+ menu, on the clicked terminal
+
+Make Persistent / Make Window-owned were missing from the context menu of a
+terminal in the editor area, and from either menu they acted on the active
+terminal rather than the one the menu was opened on. They now take the tab
+list selection, else the editor's terminal resource, else the active terminal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../terminal/browser/terminalActions.ts       | 38 ++++++++++++++-----
+ .../contrib/terminal/browser/terminalMenus.ts | 16 ++++++++
+ 2 files changed, 44 insertions(+), 10 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalActions.ts b/src/vs/workbench/contrib/terminal/browser/terminalActions.ts
+index dd488bd5..5860c85b 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalActions.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalActions.ts
+@@ -229,14 +229,30 @@ export function registerContextualInstanceAction(
+  * A wrapper around {@link registerTerminalAction} that ensures an active instance exists and
+  * provides it to the run function.
+  */
+-async function setTerminalLifetime(instance: ITerminalInstance, lifetime: TerminalLifetime, accessor: ServicesAccessor): Promise<void> {
++/**
++ * The terminals a lifetime command applies to: the tabs the panel's tab menu was opened on, the
++ * terminal of the editor whose tab menu was opened, or else the active terminal.
++ */
++function getLifetimeTargets(c: ITerminalServicesCollection, accessor: ServicesAccessor, args: unknown, allArgs: unknown): ITerminalInstance[] {
++	const selected = getSelectedViewInstances2(accessor, allArgs);
++	if (selected) {
++		return selected;
++	}
++	const instance = getResourceOrActiveInstance(c, args);
++	return instance ? [instance] : [];
++}
++
++async function setTerminalsLifetime(instances: ITerminalInstance[], lifetime: TerminalLifetime, accessor: ServicesAccessor): Promise<void> {
+ 	const notificationService = accessor.get(INotificationService);
+-	const backend = await accessor.get(ITerminalInstanceService).getBackend(instance.remoteAuthority);
+-	if (!backend?.setLifetime || instance.persistentProcessId === undefined) {
+-		notificationService.info(localize('terminalLifetimeUnsupported', "Only remote terminals with persistent sessions have a lifetime."));
+-		return;
++	const terminalInstanceService = accessor.get(ITerminalInstanceService);
++	for (const instance of instances) {
++		const backend = await terminalInstanceService.getBackend(instance.remoteAuthority);
++		if (!backend?.setLifetime || instance.persistentProcessId === undefined) {
++			notificationService.info(localize('terminalLifetimeUnsupported', "Only remote terminals with persistent sessions have a lifetime."));
++			continue;
++		}
++		await backend.setLifetime(instance.persistentProcessId, lifetime);
+ 	}
+-	await backend.setLifetime(instance.persistentProcessId, lifetime);
+ }
+ 
+ export function registerActiveInstanceAction(
+@@ -834,16 +850,18 @@ export function registerTerminalActions() {
+ 		run: (activeInstance) => activeInstance.detachProcessAndDispose(TerminalExitReason.User)
+ 	});
+ 
+-	registerActiveInstanceAction({
++	registerTerminalAction({
+ 		id: TerminalCommandId.MakePersistent,
+ 		title: localize2('workbench.action.terminal.makePersistent', 'Make Persistent'),
+-		run: (activeInstance, c, accessor) => setTerminalLifetime(activeInstance, TerminalLifetime.Persistent, accessor)
++		precondition: sharedWhenClause.terminalAvailable,
++		run: (c, accessor, args, allArgs) => setTerminalsLifetime(getLifetimeTargets(c, accessor, args, allArgs), TerminalLifetime.Persistent, accessor)
+ 	});
+ 
+-	registerActiveInstanceAction({
++	registerTerminalAction({
+ 		id: TerminalCommandId.MakeWindowOwned,
+ 		title: localize2('workbench.action.terminal.makeWindowOwned', 'Make Window-owned'),
+-		run: (activeInstance, c, accessor) => setTerminalLifetime(activeInstance, TerminalLifetime.WindowOwned, accessor)
++		precondition: sharedWhenClause.terminalAvailable,
++		run: (c, accessor, args, allArgs) => setTerminalsLifetime(getLifetimeTargets(c, accessor, args, allArgs), TerminalLifetime.WindowOwned, accessor)
+ 	});
+ 
+ 	registerTerminalAction({
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalMenus.ts b/src/vs/workbench/contrib/terminal/browser/terminalMenus.ts
+index 0bd2fce2..07e5b6e0 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalMenus.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalMenus.ts
+@@ -756,6 +756,22 @@ export function setupTerminalMenus(): void {
+ 		when: ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeTerminal),
+ 		group: '2_files'
+ 	});
++	MenuRegistry.appendMenuItem(MenuId.EditorTitleContext, {
++		command: {
++			id: TerminalCommandId.MakePersistent,
++			title: localize('workbench.action.terminal.makePersistent', "Make Persistent")
++		},
++		when: ContextKeyExpr.and(ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeTerminal), ContextKeyExpr.notEquals('remoteName', '')),
++		group: '2_files'
++	});
++	MenuRegistry.appendMenuItem(MenuId.EditorTitleContext, {
++		command: {
++			id: TerminalCommandId.MakeWindowOwned,
++			title: localize('workbench.action.terminal.makeWindowOwned', "Make Window-owned")
++		},
++		when: ContextKeyExpr.and(ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeTerminal), ContextKeyExpr.notEquals('remoteName', '')),
++		group: '2_files'
++	});
+ 	MenuRegistry.appendMenuItem(MenuId.EditorTitleContext, {
+ 		command: {
+ 			id: TerminalCommandId.SizeToContentWidth,

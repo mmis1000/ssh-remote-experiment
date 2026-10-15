@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mmis1000 <mmis10002@gmail.com>
 Date: Thu, 15 Oct 2026 20:24:40 +0800
-Subject: [PATCH 3/6] Detach lifetime-managed terminals when a window closes
+Subject: [PATCH 3/7] Detach lifetime-managed terminals when a window closes
  instead of killing them
 
 ---

@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: mmis1000 <mmis10002@gmail.com>
 Date: Thu, 15 Oct 2026 21:14:24 +0800
-Subject: [PATCH 5/6] Terminal shutdown: follow up a SIGHUP the shell ignores
+Subject: [PATCH 5/7] Terminal shutdown: follow up a SIGHUP the shell ignores
 
 Bash ignores the first SIGHUP while readline waits for the rest of an escape
 sequence (e.g. after the user pressed Escape), so killing such a terminal left
