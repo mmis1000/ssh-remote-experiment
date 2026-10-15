@@ -1,5 +1,6 @@
-# Publishes https://mmis1000.me/ssh-remote-experiment from the releases the Server and Extension
-# workflows create. Each deploy replaces the whole site, so it is always rebuilt from the releases:
+# Publishes https://mmis1000.me/ssh-remote-experiment from the releases the Build and Extension
+# workflows create. Clients stay in the releases (too big for Pages) and are linked from the index.
+# Each deploy replaces the whole site, so it is always rebuilt from the releases:
 #   reh/<commit>/vscodium-reh-linux-x64.tar.gz   the latest KEEP_BUILDS server builds (reh-<commit>)
 #   ors/open-remote-ssh.vsix                      the latest extension build (ors-<commit>)
 #   builds.json                                   { latest, builds, extension } for the extension and scripts
@@ -8,7 +9,7 @@ name: Pages
 
 on:
   workflow_run:
-    workflows: [Server, Extension]
+    workflows: [Build, Extension]
     types: [completed]
   workflow_dispatch: {}
 
@@ -42,7 +43,7 @@ jobs:
           builds=()
           for tag in $(echo "${releases}" | grep '^reh-' | head -n "${KEEP_BUILDS}"); do
             commit="${tag#reh-}"
-            gh release download "${tag}" --dir "site/reh/${commit}"
+            gh release download "${tag}" --dir "site/reh/${commit}" --pattern "vscodium-reh-*"
             builds+=("${commit}")
           done
 
@@ -67,12 +68,14 @@ jobs:
             if [[ -n "${extension_commit}" ]]; then
               echo "<h2>Open Remote SSH</h2><p><a href=\"ors/open-remote-ssh.vsix\">open-remote-ssh.vsix</a> (<code>${extension_commit}</code>). It downloads the servers below by default.</p>"
             fi
-            echo '<h2>Remote servers</h2><ul>'
+            echo '<h2>Builds</h2><p>Each build has a server and, when its client build succeeded, a Windows x64 client from the same commit (a client only connects to the server of its own build).</p><ul>'
             for commit in "${builds[@]}"; do
+              echo "<li><code>${commit}</code>:"
               for f in site/reh/${commit}/*.tar.gz; do
                 name=$(basename "$f")
-                echo "<li><code>${commit}</code>: <a href=\"reh/${commit}/${name}\">${name}</a></li>"
+                echo " <a href=\"reh/${commit}/${name}\">${name}</a>"
               done
+              echo " · <a href=\"https://github.com/${GH_REPO}/releases/tag/reh-${commit}\">release (client downloads)</a></li>"
             done
             echo '</ul>'
           } > site/index.html

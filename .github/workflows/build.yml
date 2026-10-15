@@ -1,0 +1,344 @@
+# Builds VSCodium with the patches in patches/vscode, both halves from the same commit so they
+# match, and publishes them as a GitHub release tagged reh-<commit of this repo>:
+# - the remote server (Linux x64), which the Pages workflow then serves at
+#     https://mmis1000.me/ssh-remote-experiment/reh/<commit>/vscodium-reh-linux-x64.tar.gz
+# - the client (Windows x64 zip and user setup, unsigned, updates disabled), from the release only
+#
+# The server's product commit is the commit of this repo that built it, so Open Remote SSH finds it
+# with remote.SSH.serverDownloadUrlTemplate set to
+#   https://mmis1000.me/ssh-remote-experiment/reh/${commit}/vscodium-reh-${os}-${arch}.tar.gz
+# The jobs follow VSCodium's own publish-stable-linux.yml (compile, reh_linux) and
+# publish-stable-windows.yml (compile, build). The server refuses a client with another commit, so
+# a client from this workflow pairs with the server from the same run.
+
+name: Build
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - patches/vscode/**
+      - upstream.env
+      - .github/workflows/build.yml
+  workflow_dispatch: {}
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  APP_NAME: VSCodium
+  ASSETS_REPOSITORY: VSCodium/vscodium
+  BINARY_NAME: codium
+  DISABLE_UPDATE: 'yes'
+  GH_REPO_PATH: VSCodium/vscodium
+  ORG_NAME: VSCodium
+  OS_NAME: linux
+  VSCODE_QUALITY: stable
+  SHOULD_BUILD: 'yes'
+  # The server's product commit
+  BUILD_SOURCEVERSION: ${{ github.sha }}
+
+jobs:
+  compile:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      VSCODE_ARCH: x64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Clone VSCodium and add the patches
+        run: |
+          . ./upstream.env
+          echo "RELEASE_VERSION=${RELEASE_VERSION}" >> "${GITHUB_ENV}"
+          git clone --depth 1 --branch "${VSCODIUM_TAG}" "${VSCODIUM_REPO}" vscodium
+          mkdir -p vscodium/patches/user
+          cp patches/vscode/*.patch vscodium/patches/user/
+
+      - name: Setup GCC
+        uses: egor-tensin/setup-gcc@a2861a8b8538f49cf2850980acccf6b05a1b2ae4 # v2.0
+        with:
+          version: 10
+          platform: x64
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: vscodium/.nvmrc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install libkrb5-dev
+        run: sudo apt-get update -y && sudo apt-get install -y libkrb5-dev
+
+      - name: Clone VS Code
+        working-directory: vscodium
+        run: ./get_repo.sh
+
+      - name: Compile
+        working-directory: vscodium
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SHOULD_BUILD_REH: 'no'
+          SHOULD_BUILD_REH_WEB: 'no'
+        run: ./build.sh
+
+      - name: Compress vscode artifact
+        working-directory: vscodium
+        run: |
+          find vscode -type f -not -path "*/node_modules/*" -not -path "vscode/.build/node/*" -not -path "vscode/.git/*" > vscode.txt
+          echo "vscode/.build/extensions/node_modules" >> vscode.txt
+          echo "vscode/.git" >> vscode.txt
+          tar -czf vscode.tar.gz -T vscode.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vscode
+          path: vscodium/vscode.tar.gz
+          retention-days: 3
+
+  reh:
+    needs: compile
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vscode_arch: x64
+            npm_arch: x64
+    env:
+      VSCODE_ARCH: ${{ matrix.vscode_arch }}
+      SHOULD_BUILD_REH: 'yes'
+      SHOULD_BUILD_REH_WEB: 'no'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Clone VSCodium
+        run: |
+          . ./upstream.env
+          echo "RELEASE_VERSION=${RELEASE_VERSION}" >> "${GITHUB_ENV}"
+          git clone --depth 1 --branch "${VSCODIUM_TAG}" "${VSCODIUM_REPO}" vscodium
+
+      - name: Setup GCC
+        uses: egor-tensin/setup-gcc@a2861a8b8538f49cf2850980acccf6b05a1b2ae4 # v2.0
+        with:
+          version: 10
+          platform: x64
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: vscodium/.nvmrc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install libkrb5-dev
+        run: sudo apt-get update -y && sudo apt-get install -y libkrb5-dev
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vscode
+          path: vscodium
+
+      - name: Build the server
+        working-directory: vscodium
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          npm_config_arch: ${{ matrix.npm_arch }}
+        run: ./build/linux/package_reh.sh
+
+      - name: Name the archive after the platform only
+        working-directory: vscodium/assets
+        run: |
+          mkdir -p ../out
+          mv "vscodium-reh-linux-${VSCODE_ARCH}-${RELEASE_VERSION}.tar.gz" "../out/vscodium-reh-linux-${VSCODE_ARCH}.tar.gz"
+          cd ../out && sha256sum "vscodium-reh-linux-${VSCODE_ARCH}.tar.gz" > "vscodium-reh-linux-${VSCODE_ARCH}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reh-linux-${{ matrix.vscode_arch }}
+          path: vscodium/out/*
+          retention-days: 3
+
+  compile-windows:
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      OS_NAME: windows
+      VSCODE_ARCH: x64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Clone VSCodium and add the patches
+        run: |
+          . ./upstream.env
+          echo "RELEASE_VERSION=${RELEASE_VERSION}" >> "${GITHUB_ENV}"
+          git clone --depth 1 --branch "${VSCODIUM_TAG}" "${VSCODIUM_REPO}" vscodium
+          mkdir -p vscodium/patches/user
+          cp patches/vscode/*.patch vscodium/patches/user/
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: vscodium/.nvmrc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Clone VS Code
+        working-directory: vscodium
+        run: ./get_repo.sh
+
+      - name: Compile
+        working-directory: vscodium
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SHOULD_BUILD_REH: 'no'
+          SHOULD_BUILD_REH_WEB: 'no'
+        run: ./build.sh
+
+      - name: Compress vscode artifact
+        working-directory: vscodium
+        run: |
+          find vscode -type f -not -path "*/node_modules/*" -not -path "vscode/.build/node/*" -not -path "vscode/.git/*" > vscode.txt
+          echo "vscode/.build/extensions/node_modules" >> vscode.txt
+          echo "vscode/.git" >> vscode.txt
+          tar -czf vscode.tar.gz -T vscode.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vscode-windows
+          path: vscodium/vscode.tar.gz
+          retention-days: 3
+
+  client-windows:
+    needs: compile-windows
+    runs-on: windows-2022
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    env:
+      OS_NAME: windows
+      VSCODE_ARCH: x64
+      SHOULD_BUILD_REH: 'no'
+      SHOULD_BUILD_REH_WEB: 'no'
+      # The portable zip and the per-user installer; no system installer, MSIs or CLI for now
+      SHOULD_BUILD_ZIP: 'yes'
+      SHOULD_BUILD_EXE_USR: 'yes'
+      SHOULD_BUILD_EXE_SYS: 'no'
+      SHOULD_BUILD_MSI: 'no'
+      SHOULD_BUILD_MSI_NOUP: 'no'
+      SHOULD_BUILD_CLI: 'no'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Clone VSCodium
+        run: |
+          . ./upstream.env
+          echo "RELEASE_VERSION=${RELEASE_VERSION}" >> "${GITHUB_ENV}"
+          git clone --depth 1 --branch "${VSCODIUM_TAG}" "${VSCODIUM_REPO}" vscodium
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: vscodium/.nvmrc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vscode-windows
+          path: vscodium
+
+      - name: Build the client
+        working-directory: vscodium
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          npm_config_arch: x64
+          npm_config_target_arch: x64
+        run: ./build/windows/package.sh
+
+      - name: Package the client
+        working-directory: vscodium
+        run: |
+          mkdir -p assets
+          ./prepare_assets.sh
+          ls -la assets
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: client-win32-x64
+          path: |
+            vscodium/assets/*.zip
+            vscodium/assets/*.exe
+          retention-days: 3
+
+  release:
+    # The server is published even when the client build fails
+    needs: [reh, client-windows]
+    if: ${{ !cancelled() && needs.reh.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reh-linux-*
+          path: out
+          merge-multiple: true
+
+      - uses: actions/download-artifact@v4
+        if: needs.client-windows.result == 'success'
+        with:
+          pattern: client-*
+          path: out
+          merge-multiple: true
+
+      # The Pages workflow runs after this one and publishes the server
+      - name: Create the release
+        env:
+          CLIENT_RESULT: ${{ needs.client-windows.result }}
+        run: |
+          . ./upstream.env
+          ls -la out
+          if [[ "${CLIENT_RESULT}" == "success" ]]; then
+            client_note="Client: Windows x64 \`VSCodium-win32-x64-*.zip\` (portable) and \`VSCodiumUserSetup-x64-*.exe\`, unsigned, with updates disabled. It only connects to the server from this release."
+          else
+            client_note="The Windows client build failed for this commit, so only the server is published."
+          fi
+          gh release create "reh-${GITHUB_SHA}" out/* \
+            --target "${GITHUB_SHA}" \
+            --title "Build ${GITHUB_SHA::7} (VSCodium ${VSCODIUM_TAG})" \
+            --notes "VSCodium ${VSCODIUM_TAG} with the patches from ${GITHUB_SHA}.
+
+          Server: served at https://mmis1000.me/ssh-remote-experiment/reh/${GITHUB_SHA}/ (Linux x64).
+
+          ${client_note}"
