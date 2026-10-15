@@ -1,4 +1,4 @@
-// Drives the dev VSCodium windows over CDP (scripts/dev-client.ps1 opens port 9333).
+// Drives the dev VSCodium windows over CDP (scripts/dev-client.ps1 opens port 9333; CDP_PORT overrides).
 // One step per invocation, prints JSON:
 //   node poc/drive.mjs windows
 //   node poc/drive.mjs cmd   <win> "<command palette label>"
@@ -16,7 +16,7 @@ const { chromium } = require('playwright-core');
 const [, , action, win, ...rest] = process.argv;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-const browser = await chromium.connectOverCDP('http://127.0.0.1:9333');
+const browser = await chromium.connectOverCDP(`http://127.0.0.1:${process.env.CDP_PORT || 9333}`);
 try {
 	const pages = browser.contexts().flatMap(c => c.pages());
 	const titled = await Promise.all(pages.map(async p => ({ p, title: await p.title().catch(() => '') })));

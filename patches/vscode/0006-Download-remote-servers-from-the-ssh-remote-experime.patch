@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mmis1000 <mmis10002@gmail.com>
+Date: Fri, 16 Oct 2026 00:53:13 +0800
+Subject: [PATCH 6/6] Download remote servers from the ssh-remote-experiment
+ builds
+
+VSCodium's packaging sets product.json serverDownloadUrlTemplate to its own
+releases, which hold servers with another commit than this client. Point it at
+the builds made from the same commit.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ build/gulpfile.reh.ts    | 3 ++-
+ build/gulpfile.vscode.ts | 3 ++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/build/gulpfile.reh.ts b/build/gulpfile.reh.ts
+index 8c1499cc..0b32281a 100644
+--- a/build/gulpfile.reh.ts
++++ b/build/gulpfile.reh.ts
+@@ -328,7 +328,8 @@ function packageTask(type: string, platform: string, arch: string, sourceFolderN
+ 		let productJsonContents = '';
+ 		const productJsonStream = gulp.src(['product.json'], { base: '.' })
+ 			.pipe(jsonEditor((json: Record<string, unknown>) => {
+-				json.serverDownloadUrlTemplate = 'https://github.com/VSCodium/vscodium/releases/download/1.140.06880/vscodium-reh-${os}-${arch}-1.140.06880.tar.gz';
++				// Servers built from the same commit as this client, by mmis1000/ssh-remote-experiment
++				json.serverDownloadUrlTemplate = 'https://mmis1000.me/ssh-remote-experiment/reh/${commit}/vscodium-reh-${os}-${arch}.tar.gz';
+ 				json.commit = commit;
+ 				json.nlsMetadataHash = computeNLSMetadataHash(path.join(REPO_ROOT, sourceFolderName), commit);
+ 				json.date = readISODate(sourceFolderName);
+diff --git a/build/gulpfile.vscode.ts b/build/gulpfile.vscode.ts
+index 789ebba4..e68243f4 100644
+--- a/build/gulpfile.vscode.ts
++++ b/build/gulpfile.vscode.ts
+@@ -181,7 +181,8 @@ function packageTask(platform: string, arch: string, sourceFolderName: string, d
+ 		let productJsonContents: string;
+ 		const productJsonStream = gulp.src(['product.json'], { base: '.' })
+ 			.pipe(jsonEditor((json: Record<string, unknown>) => {
+-				json.serverDownloadUrlTemplate = 'https://github.com/VSCodium/vscodium/releases/download/1.140.06880/vscodium-reh-${os}-${arch}-1.140.06880.tar.gz';
++				// Servers built from the same commit as this client, by mmis1000/ssh-remote-experiment
++				json.serverDownloadUrlTemplate = 'https://mmis1000.me/ssh-remote-experiment/reh/${commit}/vscodium-reh-${os}-${arch}.tar.gz';
+ 				json.commit = commit;
+ 				json.nlsMetadataHash = computeNLSMetadataHash(path.join(import.meta.dirname, '..', out), commit);
+ 				json.date = readISODate(out);
