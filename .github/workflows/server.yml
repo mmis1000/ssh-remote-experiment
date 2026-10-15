@@ -1,0 +1,239 @@
+# Builds the VSCodium remote server (REH) with the patches in patches/vscode and publishes it:
+# - as a GitHub release tagged reh-<commit of this repo>
+# - on GitHub Pages: https://mmis1000.me/ssh-remote-experiment/reh/<commit>/vscodium-reh-linux-x64.tar.gz
+#
+# The server's product commit is the commit of this repo that built it, so Open Remote SSH finds it
+# with remote.SSH.serverDownloadUrlTemplate set to
+#   https://mmis1000.me/ssh-remote-experiment/reh/${commit}/vscodium-reh-${os}-${arch}.tar.gz
+# The jobs follow VSCodium's own publish-stable-linux.yml (compile, then reh_linux).
+
+name: Server
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - patches/vscode/**
+      - upstream.env
+      - .github/workflows/server.yml
+  workflow_dispatch: {}
+
+concurrency:
+  group: server
+  cancel-in-progress: false
+
+env:
+  APP_NAME: VSCodium
+  ASSETS_REPOSITORY: VSCodium/vscodium
+  BINARY_NAME: codium
+  DISABLE_UPDATE: 'yes'
+  GH_REPO_PATH: VSCodium/vscodium
+  ORG_NAME: VSCodium
+  OS_NAME: linux
+  VSCODE_QUALITY: stable
+  SHOULD_BUILD: 'yes'
+  # The server's product commit
+  BUILD_SOURCEVERSION: ${{ github.sha }}
+  # How many builds the Pages site keeps
+  KEEP_BUILDS: 5
+
+jobs:
+  compile:
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      VSCODE_ARCH: x64
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Clone VSCodium and add the patches
+        run: |
+          . ./upstream.env
+          echo "RELEASE_VERSION=${RELEASE_VERSION}" >> "${GITHUB_ENV}"
+          git clone --depth 1 --branch "${VSCODIUM_TAG}" "${VSCODIUM_REPO}" vscodium
+          mkdir -p vscodium/patches/user
+          cp patches/vscode/*.patch vscodium/patches/user/
+
+      - name: Setup GCC
+        uses: egor-tensin/setup-gcc@a2861a8b8538f49cf2850980acccf6b05a1b2ae4 # v2.0
+        with:
+          version: 10
+          platform: x64
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: vscodium/.nvmrc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install libkrb5-dev
+        run: sudo apt-get update -y && sudo apt-get install -y libkrb5-dev
+
+      - name: Clone VS Code
+        working-directory: vscodium
+        run: ./get_repo.sh
+
+      - name: Compile
+        working-directory: vscodium
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SHOULD_BUILD_REH: 'no'
+          SHOULD_BUILD_REH_WEB: 'no'
+        run: ./build.sh
+
+      - name: Compress vscode artifact
+        working-directory: vscodium
+        run: |
+          find vscode -type f -not -path "*/node_modules/*" -not -path "vscode/.build/node/*" -not -path "vscode/.git/*" > vscode.txt
+          echo "vscode/.build/extensions/node_modules" >> vscode.txt
+          echo "vscode/.git" >> vscode.txt
+          tar -czf vscode.tar.gz -T vscode.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vscode
+          path: vscodium/vscode.tar.gz
+          retention-days: 3
+
+  reh:
+    needs: compile
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - vscode_arch: x64
+            npm_arch: x64
+    env:
+      VSCODE_ARCH: ${{ matrix.vscode_arch }}
+      SHOULD_BUILD_REH: 'yes'
+      SHOULD_BUILD_REH_WEB: 'no'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Clone VSCodium
+        run: |
+          . ./upstream.env
+          echo "RELEASE_VERSION=${RELEASE_VERSION}" >> "${GITHUB_ENV}"
+          git clone --depth 1 --branch "${VSCODIUM_TAG}" "${VSCODIUM_REPO}" vscodium
+
+      - name: Setup GCC
+        uses: egor-tensin/setup-gcc@a2861a8b8538f49cf2850980acccf6b05a1b2ae4 # v2.0
+        with:
+          version: 10
+          platform: x64
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: vscodium/.nvmrc
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install libkrb5-dev
+        run: sudo apt-get update -y && sudo apt-get install -y libkrb5-dev
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: vscode
+          path: vscodium
+
+      - name: Build the server
+        working-directory: vscodium
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          npm_config_arch: ${{ matrix.npm_arch }}
+        run: ./build/linux/package_reh.sh
+
+      - name: Name the archive after the platform only
+        working-directory: vscodium/assets
+        run: |
+          mkdir -p ../out
+          mv "vscodium-reh-linux-${VSCODE_ARCH}-${RELEASE_VERSION}.tar.gz" "../out/vscodium-reh-linux-${VSCODE_ARCH}.tar.gz"
+          cd ../out && sha256sum "vscodium-reh-linux-${VSCODE_ARCH}.tar.gz" > "vscodium-reh-linux-${VSCODE_ARCH}.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: reh-linux-${{ matrix.vscode_arch }}
+          path: vscodium/out/*
+          retention-days: 3
+
+  publish:
+    needs: reh
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: reh-linux-*
+          path: out
+          merge-multiple: true
+
+      - name: Create the release
+        run: |
+          . ./upstream.env
+          gh release create "reh-${GITHUB_SHA}" out/* \
+            --target "${GITHUB_SHA}" \
+            --title "Server ${GITHUB_SHA::7} (VSCodium ${VSCODIUM_TAG})" \
+            --notes "Remote server built from ${GITHUB_SHA} on VSCodium ${VSCODIUM_TAG}. Open Remote SSH: set remote.SSH.serverDownloadUrlTemplate to https://mmis1000.me/ssh-remote-experiment/reh/\${commit}/vscodium-reh-\${os}-\${arch}.tar.gz"
+
+      - name: Assemble the site from the latest releases
+        run: |
+          mkdir -p site/reh
+          tags=$(gh release list --limit 100 --json tagName,createdAt --jq '[.[] | select(.tagName | startswith("reh-"))] | sort_by(.createdAt) | reverse | .[].tagName' | head -n "${KEEP_BUILDS}")
+          builds=()
+          for tag in ${tags}; do
+            commit="${tag#reh-}"
+            gh release download "${tag}" --dir "site/reh/${commit}"
+            builds+=("${commit}")
+          done
+          {
+            echo '{'
+            echo "  \"latest\": \"${GITHUB_SHA}\","
+            echo "  \"builds\": [$(printf '"%s",' "${builds[@]}" | sed 's/,$//')]"
+            echo '}'
+          } > site/builds.json
+          {
+            echo '<!doctype html><meta charset="utf-8"><title>ssh-remote-experiment servers</title>'
+            echo '<style>body{font-family:system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem}code{word-break:break-all}</style>'
+            echo '<h1>Remote server builds</h1>'
+            echo '<p>Open Remote SSH: <code>remote.SSH.serverDownloadUrlTemplate</code> = <code>https://mmis1000.me/ssh-remote-experiment/reh/${commit}/vscodium-reh-${os}-${arch}.tar.gz</code></p><ul>'
+            for commit in "${builds[@]}"; do
+              for f in site/reh/${commit}/*.tar.gz; do
+                name=$(basename "$f")
+                echo "<li><code>${commit}</code>: <a href=\"reh/${commit}/${name}\">${name}</a></li>"
+              done
+            done
+            echo '</ul>'
+          } > site/index.html
+          find site -type f | sort
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

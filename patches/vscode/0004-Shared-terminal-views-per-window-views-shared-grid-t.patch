@@ -1,0 +1,1166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mmis1000 <mmis10002@gmail.com>
+Date: Thu, 15 Oct 2026 20:37:29 +0800
+Subject: [PATCH 4/5] Shared terminal views: per-window views, shared grid,
+ targeted replays
+
+- Pty host tracks the windows viewing each lifetime-managed terminal (attach,
+  detach, heartbeat with attached ids, gone windows); viewCount in lifetime info
+- Shared grid: views report setViewState; the pty is sized to the minimum over
+  visible views and OverrideDimensions goes to every view when shared
+- Replays go only to the attaching window and stay dimension-exact: the view
+  switches from the recorded size straight to the shared grid afterwards, and
+  grid changes during a replay are deferred
+- Terminal query replies only accepted from the most recently focused view
+- Close confirmation for terminals shown in several windows
+- Terminal: Show Remote Terminals quick pick (shares Attach to Session code)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/vs/platform/terminal/common/terminal.ts   |  32 +++-
+ .../platform/terminal/node/ptyHostService.ts  |  27 +--
+ src/vs/platform/terminal/node/ptyService.ts   | 175 +++++++++++++++---
+ src/vs/server/node/remoteTerminalChannel.ts   |   3 +-
+ .../contrib/terminal/browser/remotePty.ts     |  51 ++++-
+ .../terminal/browser/remoteTerminalBackend.ts |  50 +++--
+ .../terminal/browser/terminalActions.ts       | 111 ++++++-----
+ .../terminal/browser/terminalInstance.ts      |  18 ++
+ .../browser/terminalProcessManager.ts         |   6 +-
+ .../terminal/browser/terminalService.ts       |  20 ++
+ .../contrib/terminal/common/basePty.ts        |   9 +-
+ .../common/remote/remoteTerminalChannel.ts    |  29 +--
+ .../terminal/common/remote/terminal.ts        |   1 +
+ .../contrib/terminal/common/terminal.ts       |   5 +-
+ 14 files changed, 416 insertions(+), 121 deletions(-)
+
+diff --git a/src/vs/platform/terminal/common/terminal.ts b/src/vs/platform/terminal/common/terminal.ts
+index 6752bbaa..acf906a3 100644
+--- a/src/vs/platform/terminal/common/terminal.ts
++++ b/src/vs/platform/terminal/common/terminal.ts
+@@ -306,6 +306,19 @@ export interface ITerminalLifetimeInfo {
+ 	ownerWindowId: string | undefined;
+ 	/** Filled in by the window receiving the info: whether it is the owner. */
+ 	ownedByThisWindow?: boolean;
++	/** How many windows currently show the terminal. */
++	viewCount?: number;
++}
++
++/** What one window's view of a terminal reports to the pty host, which sizes the shared grid. */
++export interface ITerminalViewState {
++	/** The columns and rows the view could show, before the shared grid is applied. */
++	cols: number;
++	rows: number;
++	/** Whether the view is in a visible panel of a visible window. Hidden views don't count. */
++	visible: boolean;
++	/** Whether the view has focus. The most recently focused view answers terminal queries. */
++	focused: boolean;
+ }
+ 
+ export interface IFixedTerminalDimensions {
+@@ -332,7 +345,8 @@ export interface IPtyService {
+ 
+ 	readonly onProcessData: Event<{ id: number; event: IProcessDataEvent | string }>;
+ 	readonly onProcessReady: Event<{ id: number; event: IProcessReadyEvent }>;
+-	readonly onProcessReplay: Event<{ id: number; event: IPtyHostProcessReplayEvent }>;
++	/** {@link windowId} is set when the replay is meant for one window only. */
++	readonly onProcessReplay: Event<{ id: number; event: IPtyHostProcessReplayEvent; windowId?: string }>;
+ 	readonly onProcessOrphanQuestion: Event<{ id: number }>;
+ 	readonly onDidRequestDetach: Event<{ requestId: number; workspaceId: string; instanceId: number }>;
+ 	readonly onDidChangeProperty: Event<{ id: number; property: IProcessProperty }>;
+@@ -354,9 +368,11 @@ export interface IPtyService {
+ 		rawReviveBuffer?: string,
+ 		ownerWindowId?: string
+ 	): Promise<number>;
+-	attachToProcess(id: number): Promise<void>;
+-	detachFromProcess(id: number, forcePersist?: boolean): Promise<void>;
++	attachToProcess(id: number, windowId?: string): Promise<void>;
++	detachFromProcess(id: number, forcePersist?: boolean, windowId?: string): Promise<void>;
+ 	shutdownAll(): Promise<void>;
++	/** Reports a window's view of a terminal; the pty host sizes the shared grid from these. */
++	setViewState?(id: number, windowId: string, state: ITerminalViewState): Promise<void>;
+ 	/**
+ 	 * Changes a terminal's lifetime. Making it window-owned sets {@link windowId} as the owner.
+ 	 * Only implemented by pty hosts that track windows (the remote server).
+@@ -366,7 +382,7 @@ export interface IPtyService {
+ 	 * Tells the pty host that a window is still connected. A window that stops sending these is
+ 	 * treated as gone and the terminals it owns start their grace period.
+ 	 */
+-	windowHeartbeat?(windowId: string): Promise<void>;
++	windowHeartbeat?(windowId: string, attachedIds?: number[]): Promise<void>;
+ 
+ 	/**
+ 	 * Lists all orphaned processes, ie. those without a connected frontend.
+@@ -378,9 +394,10 @@ export interface IPtyService {
+ 	 */
+ 	getLatency(): Promise<IPtyHostLatencyMeasurement[]>;
+ 
+-	start(id: number): Promise<ITerminalLaunchError | ITerminalLaunchResult | undefined>;
++	/** Starts or, for a running process, re-attaches; the replay only goes to {@link windowId}. */
++	start(id: number, windowId?: string): Promise<ITerminalLaunchError | ITerminalLaunchResult | undefined>;
+ 	shutdown(id: number, immediate: boolean): Promise<void>;
+-	input(id: number, data: string): Promise<void>;
++	input(id: number, data: string, windowId?: string): Promise<void>;
+ 	sendSignal(id: number, signal: string): Promise<void>;
+ 	resize(id: number, cols: number, rows: number, pixelWidth?: number, pixelHeight?: number): Promise<void>;
+ 	clearBuffer(id: number): Promise<void>;
+@@ -857,6 +874,9 @@ export interface ITerminalChildProcess {
+ 	 */
+ 	freePortKillProcess?(port: string): Promise<{ port: string; processId: string }>;
+ 
++	/** Reports this window's view of the process so the pty host can size the shared grid. */
++	setViewState?(state: ITerminalViewState): void;
++
+ 	/**
+ 	 * Shutdown the terminal process.
+ 	 *
+diff --git a/src/vs/platform/terminal/node/ptyHostService.ts b/src/vs/platform/terminal/node/ptyHostService.ts
+index 8602e61a..be8e714f 100644
+--- a/src/vs/platform/terminal/node/ptyHostService.ts
++++ b/src/vs/platform/terminal/node/ptyHostService.ts
+@@ -13,7 +13,7 @@ import { RemoteLoggerChannelClient } from '../../log/common/logIpc.js';
+ import { getResolvedShellEnv } from '../../shell/node/shellEnv.js';
+ import { IPtyHostProcessReplayEvent } from '../common/capabilities/capabilities.js';
+ import { RequestStore } from '../common/requestStore.js';
+-import { HeartbeatConstants, IHeartbeatService, ITerminalLaunchResult, IProcessDataEvent, IProcessProperty, IProcessPropertyMap, IProcessReadyEvent, IPtyHostLatencyMeasurement, IPtyHostService, IPtyService, IRequestResolveVariablesEvent, ISerializedTerminalState, IShellLaunchConfig, ITerminalLaunchError, ITerminalProcessOptions, ITerminalProfile, ITerminalsLayoutInfo, ProcessPropertyType, TerminalIcon, TerminalIpcChannels, TerminalLifetime, TerminalSettingId, TitleEventSource } from '../common/terminal.js';
++import { HeartbeatConstants, IHeartbeatService, ITerminalLaunchResult, IProcessDataEvent, IProcessProperty, IProcessPropertyMap, IProcessReadyEvent, IPtyHostLatencyMeasurement, IPtyHostService, IPtyService, IRequestResolveVariablesEvent, ISerializedTerminalState, IShellLaunchConfig, ITerminalLaunchError, ITerminalProcessOptions, ITerminalProfile, ITerminalsLayoutInfo, ITerminalViewState, ProcessPropertyType, TerminalIcon, TerminalIpcChannels, TerminalLifetime, TerminalSettingId, TitleEventSource } from '../common/terminal.js';
+ import { registerTerminalPlatformConfiguration } from '../common/terminalPlatformConfiguration.js';
+ import { IGetTerminalLayoutInfoArgs, IProcessDetails, ISetTerminalLayoutInfoArgs } from '../common/terminalProcess.js';
+ import { IPtyHostConnection, IPtyHostStarter } from './ptyHost.js';
+@@ -77,7 +77,7 @@ export class PtyHostService extends Disposable implements IPtyHostService {
+ 	readonly onProcessData = this._onProcessData.event;
+ 	private readonly _onProcessReady = this._register(new Emitter<{ id: number; event: IProcessReadyEvent }>());
+ 	readonly onProcessReady = this._onProcessReady.event;
+-	private readonly _onProcessReplay = this._register(new Emitter<{ id: number; event: IPtyHostProcessReplayEvent }>());
++	private readonly _onProcessReplay = this._register(new Emitter<{ id: number; event: IPtyHostProcessReplayEvent; windowId?: string }>());
+ 	readonly onProcessReplay = this._onProcessReplay.event;
+ 	private readonly _onProcessOrphanQuestion = this._register(new Emitter<{ id: number }>());
+ 	readonly onProcessOrphanQuestion = this._onProcessOrphanQuestion.event;
+@@ -223,17 +223,20 @@ export class PtyHostService extends Disposable implements IPtyHostService {
+ 	updateIcon(id: number, userInitiated: boolean, icon: TerminalIcon, color?: string): Promise<void> {
+ 		return this._proxy.updateIcon(id, userInitiated, icon, color);
+ 	}
+-	attachToProcess(id: number): Promise<void> {
+-		return this._proxy.attachToProcess(id);
++	attachToProcess(id: number, windowId?: string): Promise<void> {
++		return this._proxy.attachToProcess(id, windowId);
+ 	}
+-	detachFromProcess(id: number, forcePersist?: boolean): Promise<void> {
+-		return this._proxy.detachFromProcess(id, forcePersist);
++	detachFromProcess(id: number, forcePersist?: boolean, windowId?: string): Promise<void> {
++		return this._proxy.detachFromProcess(id, forcePersist, windowId);
++	}
++	async setViewState(id: number, windowId: string, state: ITerminalViewState): Promise<void> {
++		return this._proxy.setViewState?.(id, windowId, state);
+ 	}
+ 	async setLifetime(id: number, lifetime: TerminalLifetime, windowId: string): Promise<void> {
+ 		return this._proxy.setLifetime?.(id, lifetime, windowId);
+ 	}
+-	async windowHeartbeat(windowId: string): Promise<void> {
+-		return this._proxy.windowHeartbeat?.(windowId);
++	async windowHeartbeat(windowId: string, attachedIds?: number[]): Promise<void> {
++		return this._proxy.windowHeartbeat?.(windowId, attachedIds);
+ 	}
+ 	shutdownAll(): Promise<void> {
+ 		return this._proxy.shutdownAll();
+@@ -247,14 +250,14 @@ export class PtyHostService extends Disposable implements IPtyHostService {
+ 	async reduceConnectionGraceTime(): Promise<void> {
+ 		return this._optionalProxy?.reduceConnectionGraceTime();
+ 	}
+-	start(id: number): Promise<ITerminalLaunchError | ITerminalLaunchResult | undefined> {
+-		return this._proxy.start(id);
++	start(id: number, windowId?: string): Promise<ITerminalLaunchError | ITerminalLaunchResult | undefined> {
++		return this._proxy.start(id, windowId);
+ 	}
+ 	shutdown(id: number, immediate: boolean): Promise<void> {
+ 		return this._proxy.shutdown(id, immediate);
+ 	}
+-	input(id: number, data: string): Promise<void> {
+-		return this._proxy.input(id, data);
++	input(id: number, data: string, windowId?: string): Promise<void> {
++		return this._proxy.input(id, data, windowId);
+ 	}
+ 	sendSignal(id: number, signal: string): Promise<void> {
+ 		return this._proxy.sendSignal(id, signal);
+diff --git a/src/vs/platform/terminal/node/ptyService.ts b/src/vs/platform/terminal/node/ptyService.ts
+index 99dc21ae..74aee150 100644
+--- a/src/vs/platform/terminal/node/ptyService.ts
++++ b/src/vs/platform/terminal/node/ptyService.ts
+@@ -12,7 +12,7 @@ import { URI } from '../../../base/common/uri.js';
+ import { getSystemShell } from '../../../base/node/shell.js';
+ import { ILogService, LogLevel } from '../../log/common/log.js';
+ import { RequestStore } from '../common/requestStore.js';
+-import { IProcessDataEvent, IProcessReadyEvent, IPtyService, IRawTerminalInstanceLayoutInfo, IReconnectConstants, IShellLaunchConfig, ITerminalInstanceLayoutInfoById, ITerminalLaunchError, ITerminalsLayoutInfo, ITerminalTabLayoutInfoById, TerminalIcon, IProcessProperty, TitleEventSource, ProcessPropertyType, IProcessPropertyMap, IFixedTerminalDimensions, IPersistentTerminalProcessLaunchConfig, ICrossVersionSerializedTerminalState, ISerializedTerminalState, ITerminalProcessOptions, IPtyHostLatencyMeasurement, type IPtyServiceContribution, PosixShellType, ITerminalLaunchResult, ITerminalLifetimeInfo, TerminalLifetime } from '../common/terminal.js';
++import { IProcessDataEvent, IProcessReadyEvent, IPtyService, IRawTerminalInstanceLayoutInfo, IReconnectConstants, IShellLaunchConfig, ITerminalInstanceLayoutInfoById, ITerminalLaunchError, ITerminalsLayoutInfo, ITerminalTabLayoutInfoById, TerminalIcon, IProcessProperty, TitleEventSource, ProcessPropertyType, IProcessPropertyMap, IFixedTerminalDimensions, IPersistentTerminalProcessLaunchConfig, ICrossVersionSerializedTerminalState, ISerializedTerminalState, ITerminalProcessOptions, IPtyHostLatencyMeasurement, type IPtyServiceContribution, PosixShellType, ITerminalLaunchResult, ITerminalLifetimeInfo, ITerminalViewState, TerminalLifetime } from '../common/terminal.js';
+ import { TerminalDataBufferer } from '../common/terminalDataBuffering.js';
+ import { escapeNonWindowsPath } from '../common/terminalEnvironment.js';
+ import type { ISerializeOptions, SerializeAddon as XtermSerializeAddon } from '@xterm/addon-serialize';
+@@ -137,7 +137,7 @@ export class PtyService extends Disposable implements IPtyService {
+ 
+ 	private readonly _onProcessData = this._register(new Emitter<{ id: number; event: IProcessDataEvent | string }>());
+ 	readonly onProcessData = this._traceEvent('_onProcessData', this._onProcessData.event);
+-	private readonly _onProcessReplay = this._register(new Emitter<{ id: number; event: IPtyHostProcessReplayEvent }>());
++	private readonly _onProcessReplay = this._register(new Emitter<{ id: number; event: IPtyHostProcessReplayEvent; windowId?: string }>());
+ 	readonly onProcessReplay = this._traceEvent('_onProcessReplay', this._onProcessReplay.event);
+ 	private readonly _onProcessReady = this._register(new Emitter<{ id: number; event: IProcessReadyEvent }>());
+ 	readonly onProcessReady = this._traceEvent('_onProcessReady', this._onProcessReady.event);
+@@ -196,7 +196,7 @@ export class PtyService extends Disposable implements IPtyService {
+ 	}
+ 
+ 	@traceRpc
+-	async windowHeartbeat(windowId: string): Promise<void> {
++	async windowHeartbeat(windowId: string, attachedIds?: number[]): Promise<void> {
+ 		this._windowLastSeen.set(windowId, Date.now());
+ 		if (this._goneWindows.delete(windowId)) {
+ 			this._logService.info(`Window ${windowId} is back, cancelling the grace period of the terminals it owns`);
+@@ -206,6 +206,21 @@ export class PtyService extends Disposable implements IPtyService {
+ 				}
+ 			}
+ 		}
++		// The heartbeat lists what the window shows, which repairs views after a reconnect
++		if (attachedIds) {
++			for (const [id, pty] of this._ptys) {
++				if (attachedIds.includes(id)) {
++					pty.addView(windowId);
++				} else {
++					pty.removeView(windowId);
++				}
++			}
++		}
++	}
++
++	@traceRpc
++	async setViewState(id: number, windowId: string, state: ITerminalViewState): Promise<void> {
++		this._ptys.get(id)?.setViewState(windowId, state);
+ 	}
+ 
+ 	@traceRpc
+@@ -226,6 +241,7 @@ export class PtyService extends Disposable implements IPtyService {
+ 			this._goneWindows.add(windowId);
+ 			this._logService.info(`Window ${windowId} stopped sending heartbeats, starting the grace period of the terminals it owns`);
+ 			for (const pty of this._ptys.values()) {
++				pty.removeView(windowId);
+ 				if (pty.lifetime?.ownerWindowId === windowId) {
+ 					pty.startOwnerGrace();
+ 				}
+@@ -405,7 +421,7 @@ export class PtyService extends Disposable implements IPtyService {
+ 			this._onProcessExit.fire({ id, event });
+ 		});
+ 		persistentProcess.onProcessData(event => this._onProcessData.fire({ id, event }));
+-		persistentProcess.onProcessReplay(event => this._onProcessReplay.fire({ id, event }));
++		persistentProcess.onProcessReplay(({ event, windowId }) => this._onProcessReplay.fire({ id, event, windowId }));
+ 		persistentProcess.onProcessReady(event => this._onProcessReady.fire({ id, event }));
+ 		persistentProcess.onProcessOrphanQuestion(() => this._onProcessOrphanQuestion.fire({ id }));
+ 		persistentProcess.onDidChangeProperty(property => this._onDidChangeProperty.fire({ id, property }));
+@@ -417,15 +433,20 @@ export class PtyService extends Disposable implements IPtyService {
+ 		this._ptys.set(id, persistentProcess);
+ 		if (shouldPersist && ownerWindowId) {
+ 			await this.windowHeartbeat(ownerWindowId);
++			persistentProcess.addView(ownerWindowId);
+ 			persistentProcess.setLifetime({ lifetime: TerminalLifetime.WindowOwned, ownerWindowId }, this._ownerGraceTime);
+ 		}
+ 		return id;
+ 	}
+ 
+ 	@traceRpc
+-	async attachToProcess(id: number): Promise<void> {
++	async attachToProcess(id: number, windowId?: string): Promise<void> {
+ 		try {
+-			await this._throwIfNoPty(id).attach();
++			const pty = this._throwIfNoPty(id);
++			await pty.attach();
++			if (windowId) {
++				pty.addView(windowId);
++			}
+ 			this._logService.info(`Persistent process reconnection "${id}"`);
+ 		} catch (e) {
+ 			this._logService.warn(`Persistent process reconnection "${id}" failed`, e.message);
+@@ -459,8 +480,12 @@ export class PtyService extends Disposable implements IPtyService {
+ 	}
+ 
+ 	@traceRpc
+-	async detachFromProcess(id: number, forcePersist?: boolean): Promise<void> {
+-		return this._throwIfNoPty(id).detach(forcePersist);
++	async detachFromProcess(id: number, forcePersist?: boolean, windowId?: string): Promise<void> {
++		const pty = this._throwIfNoPty(id);
++		if (windowId) {
++			pty.removeView(windowId);
++		}
++		return pty.detach(forcePersist);
+ 	}
+ 
+ 	@traceRpc
+@@ -477,7 +502,8 @@ export class PtyService extends Disposable implements IPtyService {
+ 		this._logService.info(`Listing ${persistentProcesses.length} persistent terminals, ${this._ptys.size} total terminals`);
+ 		const promises = persistentProcesses.map(async ([id, terminalProcessData]) => this._buildProcessDetails(id, terminalProcessData));
+ 		const allTerminals = await Promise.all(promises);
+-		return allTerminals.filter(entry => entry.isOrphan);
++		// Terminals with a lifetime are listed whoever shows them, so any window can attach a view
++		return allTerminals.filter(entry => entry.isOrphan || entry.lifetime);
+ 	}
+ 
+ 	@traceRpc
+@@ -486,9 +512,9 @@ export class PtyService extends Disposable implements IPtyService {
+ 	}
+ 
+ 	@traceRpc
+-	async start(id: number): Promise<ITerminalLaunchError | ITerminalLaunchResult | undefined> {
++	async start(id: number, windowId?: string): Promise<ITerminalLaunchError | ITerminalLaunchResult | undefined> {
+ 		const pty = this._ptys.get(id);
+-		return pty ? pty.start() : { message: `Could not find pty with id "${id}"` };
++		return pty ? pty.start(windowId) : { message: `Could not find pty with id "${id}"` };
+ 	}
+ 
+ 	@traceRpc
+@@ -497,9 +523,12 @@ export class PtyService extends Disposable implements IPtyService {
+ 		return this._ptys.get(id)?.shutdown(immediate);
+ 	}
+ 	@traceRpc
+-	async input(id: number, data: string): Promise<void> {
++	async input(id: number, data: string, windowId?: string): Promise<void> {
+ 		const pty = this._throwIfNoPty(id);
+ 		if (pty) {
++			if (!pty.acceptInputFrom(windowId, data)) {
++				return;
++			}
+ 			for (const contrib of this._contributions) {
+ 				contrib.handleProcessInput(id, data);
+ 			}
+@@ -517,6 +546,10 @@ export class PtyService extends Disposable implements IPtyService {
+ 	@traceRpc
+ 	async resize(id: number, cols: number, rows: number, pixelWidth?: number, pixelHeight?: number): Promise<void> {
+ 		const pty = this._throwIfNoPty(id);
++		// Views of a terminal with a lifetime size it through setViewState
++		if (pty?.sizedByViews) {
++			return;
++		}
+ 		if (pty) {
+ 			for (const contrib of this._contributions) {
+ 				contrib.handleProcessResize(id, cols, rows, pixelWidth, pixelHeight);
+@@ -698,7 +731,7 @@ export class PtyService extends Disposable implements IPtyService {
+ 		performance.mark(`code/willBuildProcessDetails/${id}`);
+ 		// If the process was just revived, don't do the orphan check as it will
+ 		// take some time
+-		const [cwd, isOrphan] = await Promise.all([persistentProcess.getCwd(), wasRevived ? true : persistentProcess.isOrphaned()]);
++		const [cwd, isOrphan] = await Promise.all([persistentProcess.getCwd(), wasRevived ? true : persistentProcess.lifetime ? persistentProcess.viewCount === 0 : persistentProcess.isOrphaned()]);
+ 		const result = {
+ 			id,
+ 			title: persistentProcess.title,
+@@ -720,7 +753,7 @@ export class PtyService extends Disposable implements IPtyService {
+ 			hasChildProcesses: persistentProcess.hasChildProcesses,
+ 			shellIntegrationNonce: persistentProcess.processLaunchOptions.options.shellIntegration.nonce,
+ 			tabActions: persistentProcess.shellLaunchConfig.tabActions,
+-			lifetime: persistentProcess.lifetime
++			lifetime: persistentProcess.lifetime && { ...persistentProcess.lifetime, viewCount: persistentProcess.viewCount }
+ 		};
+ 		performance.mark(`code/didBuildProcessDetails/${id}`);
+ 		return result;
+@@ -760,8 +793,14 @@ class PersistentTerminalProcess extends Disposable {
+ 	private _disconnectRunner2: ProcessTimeRunOnceScheduler;
+ 	private _lifetime: ITerminalLifetimeInfo | undefined;
+ 	private _ownerGraceRunner: ProcessTimeRunOnceScheduler | undefined;
+-
+-	private readonly _onProcessReplay = this._register(new Emitter<IPtyHostProcessReplayEvent>());
++	/** Windows showing this terminal, with the size their view could show once reported. */
++	private readonly _views = new Map<string, ITerminalViewState | undefined>();
++	/** The window whose view answers terminal queries: the most recently focused one. */
++	private _replyWindowId: string | undefined;
++	private readonly _gridRunner: ProcessTimeRunOnceScheduler;
++	private _overrideGrid: { cols: number; rows: number } | undefined;
++
++	private readonly _onProcessReplay = this._register(new Emitter<{ event: IPtyHostProcessReplayEvent; windowId?: string }>());
+ 	readonly onProcessReplay = this._onProcessReplay.event;
+ 	private readonly _onProcessReady = this._register(new Emitter<IProcessReadyEvent>());
+ 	readonly onProcessReady = this._onProcessReady.event;
+@@ -776,6 +815,8 @@ class PersistentTerminalProcess extends Disposable {
+ 	readonly onDidChangeProperty = this._onDidChangeProperty.event;
+ 
+ 	private _inReplay = false;
++	private _serializerCols: number;
++	private _serializerRows: number;
+ 
+ 	private _pid = -1;
+ 	private _cwd = '';
+@@ -795,6 +836,9 @@ class PersistentTerminalProcess extends Disposable {
+ 	get fixedDimensions(): IFixedTerminalDimensions | undefined { return this._fixedDimensions; }
+ 	get hasChildProcesses(): boolean { return this._terminalProcess.hasChildProcesses; }
+ 	get lifetime(): ITerminalLifetimeInfo | undefined { return this._lifetime; }
++	get viewCount(): number { return this._views.size; }
++	/** Whether the shared grid of the views sizes the pty, rather than plain resize calls. */
++	get sizedByViews(): boolean { return !!this._lifetime && [...this._views.values()].some(v => v !== undefined); }
+ 
+ 	setTitle(title: string, titleSource: TitleEventSource): void {
+ 		if (titleSource === TitleEventSource.Api) {
+@@ -858,6 +902,9 @@ class PersistentTerminalProcess extends Disposable {
+ 			this.setTitle(name, TitleEventSource.Api);
+ 		}
+ 		this._fixedDimensions = fixedDimensions;
++		this._serializerCols = cols;
++		this._serializerRows = rows;
++		this._gridRunner = this._register(new ProcessTimeRunOnceScheduler(() => this._updateGrid(), 50));
+ 		this._orphanQuestionBarrier = null;
+ 		this._orphanQuestionReplyTime = 0;
+ 		this._disconnectRunner1 = this._register(new ProcessTimeRunOnceScheduler(() => {
+@@ -899,7 +946,75 @@ class PersistentTerminalProcess extends Disposable {
+ 			this._logService.info(`Persistent process "${this._persistentProcessId}": owner window ${this._lifetime?.ownerWindowId} did not come back within ${printTime(ownerGraceTime)}, shutting down pid ${this._pid}`);
+ 			this.shutdown(true);
+ 		}, ownerGraceTime));
+-		this._onDidChangeProperty.fire({ type: ProcessPropertyType.Lifetime, value: lifetime });
++		this._fireLifetime();
++	}
++
++	addView(windowId: string): void {
++		if (!this._views.has(windowId)) {
++			this._views.set(windowId, undefined);
++			this._replyWindowId ??= windowId;
++			this._logService.info(`Persistent process "${this._persistentProcessId}": view added for window ${windowId}, ${this._views.size} view(s)`);
++			this._fireLifetime();
++		}
++	}
++
++	removeView(windowId: string): void {
++		if (this._views.delete(windowId)) {
++			if (this._replyWindowId === windowId) {
++				this._replyWindowId = this._views.keys().next().value;
++			}
++			this._logService.info(`Persistent process "${this._persistentProcessId}": view removed for window ${windowId}, ${this._views.size} view(s)`);
++			this._fireLifetime();
++			this._gridRunner.schedule();
++		}
++	}
++
++	setViewState(windowId: string, state: ITerminalViewState): void {
++		this._views.set(windowId, state);
++		if (state.focused) {
++			this._replyWindowId = windowId;
++		}
++		// Debounced so a burst of resizes from several views causes one SIGWINCH
++		this._gridRunner.schedule();
++	}
++
++	/**
++	 * Whether input from a window reaches the shell. Every view can type, but replies to terminal
++	 * queries only count from one view, otherwise the application gets one answer per view.
++	 */
++	acceptInputFrom(windowId: string | undefined, data: string): boolean {
++		if (!windowId || this._views.size < 2 || !isTerminalReply(data)) {
++			if (windowId && this._views.has(windowId) && !isTerminalReply(data)) {
++				this._replyWindowId = windowId;
++			}
++			return true;
++		}
++		return windowId === this._replyWindowId;
++	}
++
++	/** Applies the smallest size among the visible views to the pty and to every view. */
++	private _updateGrid(): void {
++		const counted = [...this._views.values()].filter((v): v is ITerminalViewState => !!v && v.visible && v.cols > 0 && v.rows > 0);
++		if (counted.length === 0) {
++			// Nothing visible: keep the last size
++			return;
++		}
++		const cols = Math.min(...counted.map(v => v.cols));
++		const rows = Math.min(...counted.map(v => v.rows));
++		if (cols !== this._serializerCols || rows !== this._serializerRows) {
++			this._logService.info(`Persistent process "${this._persistentProcessId}": grid ${cols}x${rows} from ${counted.length} visible view(s)`);
++			this._serializer.handleResize(cols, rows);
++			this._serializerCols = cols;
++			this._serializerRows = rows;
++			this._bufferer.flushBuffer(this._persistentProcessId);
++			this._terminalProcess.resize(cols, rows);
++		}
++		// Only constrain the views when more than one counts, a single view sizes freely
++		const override = this._views.size > 1 ? { cols, rows } : undefined;
++		if (override?.cols !== this._overrideGrid?.cols || override?.rows !== this._overrideGrid?.rows) {
++			this._overrideGrid = override;
++			this._onDidChangeProperty.fire({ type: ProcessPropertyType.OverrideDimensions, value: override });
++		}
+ 	}
+ 
+ 	startOwnerGrace(): void {
+@@ -955,7 +1070,7 @@ class PersistentTerminalProcess extends Disposable {
+ 		}
+ 	}
+ 
+-	async start(): Promise<ITerminalLaunchError | ITerminalLaunchResult | undefined> {
++	async start(windowId?: string): Promise<ITerminalLaunchError | ITerminalLaunchResult | undefined> {
+ 		if (!this._isStarted) {
+ 			const result = await this._terminalProcess.start();
+ 			if (result && hasKey(result, { message: true })) {
+@@ -982,13 +1097,18 @@ class PersistentTerminalProcess extends Disposable {
+ 		this._onDidChangeProperty.fire({ type: ProcessPropertyType.Title, value: this._terminalProcess.currentTitle });
+ 		this._onDidChangeProperty.fire({ type: ProcessPropertyType.ShellType, value: this._terminalProcess.shellType });
+ 		this._fireLifetime();
+-		this.triggerReplay();
++		// Before the replay, so the view knows the size to switch to once the replay (which uses
++		// the exact size the buffer was recorded at) ends
++		if (this._overrideGrid) {
++			this._onDidChangeProperty.fire({ type: ProcessPropertyType.OverrideDimensions, value: this._overrideGrid });
++		}
++		this.triggerReplay(windowId);
+ 		return undefined;
+ 	}
+ 
+ 	private _fireLifetime(): void {
+ 		if (this._lifetime) {
+-			this._onDidChangeProperty.fire({ type: ProcessPropertyType.Lifetime, value: this._lifetime });
++			this._onDidChangeProperty.fire({ type: ProcessPropertyType.Lifetime, value: { ...this._lifetime, viewCount: this._views.size } });
+ 		}
+ 	}
+ 	shutdown(immediate: boolean): void {
+@@ -1016,6 +1136,8 @@ class PersistentTerminalProcess extends Disposable {
+ 			return;
+ 		}
+ 		this._serializer.handleResize(cols, rows);
++		this._serializerCols = cols;
++		this._serializerRows = rows;
+ 
+ 		// Buffered events should flush when a resize occurs
+ 		this._bufferer.flushBuffer(this._persistentProcessId);
+@@ -1049,7 +1171,7 @@ class PersistentTerminalProcess extends Disposable {
+ 		return this._terminalProcess.getCwd();
+ 	}
+ 
+-	async triggerReplay(): Promise<void> {
++	async triggerReplay(windowId?: string): Promise<void> {
+ 		if (this._interactionState.value === InteractionState.None) {
+ 			this._interactionState.setValue(InteractionState.ReplayOnly, 'triggerReplay');
+ 		}
+@@ -1059,7 +1181,7 @@ class PersistentTerminalProcess extends Disposable {
+ 			dataLength += e.data.length;
+ 		}
+ 		this._logService.info(`Persistent process "${this._persistentProcessId}": Replaying ${dataLength} chars and ${ev.events.length} size events`);
+-		this._onProcessReplay.fire(ev);
++		this._onProcessReplay.fire({ event: ev, windowId });
+ 		this._terminalProcess.clearUnacknowledgedChars();
+ 		this._onPersistentProcessReady.fire();
+ 	}
+@@ -1251,6 +1373,15 @@ export class XtermSerializer implements ITerminalSerializer {
+ 	}
+ }
+ 
++/**
++ * Whether data a view sends is only replies to terminal queries (device attributes, cursor
++ * position, mode reports, color queries, focus reports), rather than something a user typed.
++ */
++const terminalReplyRegex = /^(?:\x1b\[[?>]?[\d;]*[cnR]|\x1b\[\??[\d;]*\$y|\x1b\[[IO]|\x1b\]\d+;[^\x07\x1b]*(?:\x07|\x1b\\)|\x1bP[^\x1b]*\x1b\\)+$/;
++function isTerminalReply(data: string): boolean {
++	return terminalReplyRegex.test(data);
++}
++
+ function printTime(ms: number): string {
+ 	let h = 0;
+ 	let m = 0;
+diff --git a/src/vs/server/node/remoteTerminalChannel.ts b/src/vs/server/node/remoteTerminalChannel.ts
+index 8f06c3e4..d7a7236c 100644
+--- a/src/vs/server/node/remoteTerminalChannel.ts
++++ b/src/vs/server/node/remoteTerminalChannel.ts
+@@ -164,7 +164,8 @@ export class RemoteTerminalChannel extends Disposable implements IServerChannel<
+ 			case RemoteTerminalChannelRequest.FreePortKillProcess: return this._ptyHostService.freePortKillProcess.apply(this._ptyHostService, args);
+ 			case RemoteTerminalChannelRequest.AcceptDetachInstanceReply: return this._ptyHostService.acceptDetachInstanceReply.apply(this._ptyHostService, args);
+ 			case RemoteTerminalChannelRequest.SetLifetime: return this._ptyHostService.setLifetime?.(args[0], args[1], args[2]);
+-			case RemoteTerminalChannelRequest.WindowHeartbeat: return this._ptyHostService.windowHeartbeat?.(args[0]);
++			case RemoteTerminalChannelRequest.WindowHeartbeat: return this._ptyHostService.windowHeartbeat?.(args[0], args[1]);
++			case RemoteTerminalChannelRequest.SetViewState: return this._ptyHostService.setViewState?.(args[0], args[1], args[2]);
+ 		}
+ 
+ 		// @ts-expect-error Assert command is the `never` type to ensure all messages are handled
+diff --git a/src/vs/workbench/contrib/terminal/browser/remotePty.ts b/src/vs/workbench/contrib/terminal/browser/remotePty.ts
+index bf7e4f82..05991b5d 100644
+--- a/src/vs/workbench/contrib/terminal/browser/remotePty.ts
++++ b/src/vs/workbench/contrib/terminal/browser/remotePty.ts
+@@ -3,9 +3,11 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
+-import { Barrier } from '../../../../base/common/async.js';
++import { Barrier, RunOnceScheduler } from '../../../../base/common/async.js';
+ import { Emitter } from '../../../../base/common/event.js';
+-import { ITerminalLaunchResult, IProcessProperty, IProcessPropertyMap, ITerminalChildProcess, ITerminalLaunchError, ITerminalLogService, ProcessPropertyType } from '../../../../platform/terminal/common/terminal.js';
++import { addDisposableListener } from '../../../../base/browser/dom.js';
++import { mainWindow } from '../../../../base/browser/window.js';
++import { ITerminalLaunchResult, IProcessProperty, IProcessPropertyMap, ITerminalChildProcess, ITerminalLaunchError, ITerminalLogService, ITerminalViewState, ProcessPropertyType } from '../../../../platform/terminal/common/terminal.js';
+ import { BasePty } from '../common/basePty.js';
+ import { RemoteTerminalChannelClient } from '../common/remote/remoteTerminalChannel.js';
+ import { IRemoteAgentService } from '../../../services/remote/common/remoteAgentService.js';
+@@ -18,6 +20,13 @@ export class RemotePty extends BasePty implements ITerminalChildProcess {
+ 	/** Fired once this window has left the process; it keeps running on the pty host. */
+ 	readonly onDidDetach = this._onDidDetach.event;
+ 
++	/** The last view state the instance reported, before the window's visibility is applied. */
++	private _viewState: ITerminalViewState | undefined;
++	private _sentViewState: string | undefined;
++	/** The size the pty host shares between the windows showing this terminal, if more than one. */
++	private _gridOverride: IProcessPropertyMap[ProcessPropertyType.OverrideDimensions];
++	private readonly _viewStateRunner = this._register(new RunOnceScheduler(() => this._sendViewState(), 50));
++
+ 	constructor(
+ 		id: number,
+ 		shouldPersist: boolean,
+@@ -28,6 +37,8 @@ export class RemotePty extends BasePty implements ITerminalChildProcess {
+ 	) {
+ 		super(id, shouldPersist);
+ 		this._startBarrier = new Barrier();
++		// A minimized or hidden window doesn't count towards the shared grid
++		this._register(addDisposableListener(mainWindow.document, 'visibilitychange', () => this._viewStateRunner.schedule()));
+ 	}
+ 
+ 	async start(): Promise<ITerminalLaunchError | ITerminalLaunchResult | undefined> {
+@@ -40,7 +51,7 @@ export class RemotePty extends BasePty implements ITerminalChildProcess {
+ 
+ 		this._logService.trace('Spawning remote agent process', { terminalId: this.id });
+ 
+-		const startResult = await this._remoteTerminalChannel.start(this.id);
++		const startResult = await this._remoteTerminalChannel.start(this.id, this._windowId);
+ 
+ 		if (startResult && hasKey(startResult, { message: true })) {
+ 			// An error occurred
+@@ -53,7 +64,7 @@ export class RemotePty extends BasePty implements ITerminalChildProcess {
+ 
+ 	async detach(forcePersist?: boolean): Promise<void> {
+ 		await this._startBarrier.wait();
+-		await this._remoteTerminalChannel.detachFromProcess(this.id, forcePersist);
++		await this._remoteTerminalChannel.detachFromProcess(this.id, forcePersist, this._windowId);
+ 		this._onDidDetach.fire();
+ 	}
+ 
+@@ -69,7 +80,7 @@ export class RemotePty extends BasePty implements ITerminalChildProcess {
+ 		}
+ 
+ 		this._startBarrier.wait().then(_ => {
+-			this._remoteTerminalChannel.input(this.id, data);
++			this._remoteTerminalChannel.input(this.id, data, this._windowId);
+ 		});
+ 	}
+ 
+@@ -98,6 +109,25 @@ export class RemotePty extends BasePty implements ITerminalChildProcess {
+ 		});
+ 	}
+ 
++	setViewState(state: ITerminalViewState): void {
++		this._viewState = state;
++		this._viewStateRunner.schedule();
++	}
++
++	private _sendViewState(): void {
++		if (!this._viewState || !this._windowId) {
++			return;
++		}
++		const windowId = this._windowId;
++		const state: ITerminalViewState = { ...this._viewState, visible: this._viewState.visible && mainWindow.document.visibilityState === 'visible' };
++		const key = JSON.stringify(state);
++		if (key === this._sentViewState) {
++			return;
++		}
++		this._sentViewState = key;
++		this._startBarrier.wait().then(_ => this._remoteTerminalChannel.setViewState(this.id, windowId, state));
++	}
++
+ 	async clearBuffer(): Promise<void> {
+ 		await this._remoteTerminalChannel.clearBuffer(this.id);
+ 	}
+@@ -132,7 +162,18 @@ export class RemotePty extends BasePty implements ITerminalChildProcess {
+ 		return this._remoteTerminalChannel.updateProperty(this.id, type, value);
+ 	}
+ 
++	protected override _getOverrideAfterReplay(): IProcessPropertyMap[ProcessPropertyType.OverrideDimensions] {
++		return this._gridOverride;
++	}
++
+ 	override handleDidChangeProperty(property: IProcessProperty): void {
++		if (property.type === ProcessPropertyType.OverrideDimensions) {
++			this._gridOverride = property.value as IProcessPropertyMap[ProcessPropertyType.OverrideDimensions];
++			// A replay is written at the size it was recorded at and ends on the latest grid
++			if (this._inReplay) {
++				return;
++			}
++		}
+ 		if (property.type === ProcessPropertyType.Lifetime) {
+ 			const info = property.value as IProcessPropertyMap[ProcessPropertyType.Lifetime];
+ 			if (info) {
+diff --git a/src/vs/workbench/contrib/terminal/browser/remoteTerminalBackend.ts b/src/vs/workbench/contrib/terminal/browser/remoteTerminalBackend.ts
+index 3d257d24..3333ebc7 100644
+--- a/src/vs/workbench/contrib/terminal/browser/remoteTerminalBackend.ts
++++ b/src/vs/workbench/contrib/terminal/browser/remoteTerminalBackend.ts
+@@ -78,6 +78,7 @@ function getWindowId(): string {
+ class RemoteTerminalBackend extends BaseTerminalBackend implements ITerminalBackend {
+ 	private readonly _ptys: Map<number, RemotePty> = new Map();
+ 	private readonly _windowId = getWindowId();
++	private _pendingAttaches = 0;
+ 
+ 	private readonly _whenConnected = new DeferredPromise<void>();
+ 	get whenReady(): Promise<void> { return this._whenConnected.p; }
+@@ -107,6 +108,10 @@ class RemoteTerminalBackend extends BaseTerminalBackend implements ITerminalBack
+ 
+ 		this._register(this._remoteTerminalChannel.onProcessData(e => this._ptys.get(e.id)?.handleData(e.event)));
+ 		this._register(this._remoteTerminalChannel.onProcessReplay(e => {
++			// A replay for a window that attaches is not for the other windows showing the terminal
++			if (e.windowId && e.windowId !== this._windowId) {
++				return;
++			}
+ 			this._ptys.get(e.id)?.handleReplay(e.event);
+ 			if (e.event.commands.commands.length > 0) {
+ 				this._onRestoreCommands.fire({ id: e.id, commands: e.event.commands.commands });
+@@ -149,7 +154,12 @@ class RemoteTerminalBackend extends BaseTerminalBackend implements ITerminalBack
+ 
+ 		// Tell the pty host this window is still here, so the terminals it owns stay alive
+ 		const heartbeat = this._register(new IntervalTimer());
+-		const beat = () => this._remoteTerminalChannel.windowHeartbeat(this._windowId).catch(e => this._logService.trace('Terminal window heartbeat failed', e));
++		const beat = () => {
++			// The heartbeat lists the terminals this window shows; while one is being created or
++			// attached its id isn't known yet, and a list without it would drop its view
++			const attachedIds = this._pendingAttaches > 0 ? undefined : [...this._ptys.keys()];
++			this._remoteTerminalChannel.windowHeartbeat(this._windowId, attachedIds).catch(e => this._logService.trace('Terminal window heartbeat failed', e));
++		};
+ 		beat();
+ 		heartbeat.cancelAndSet(beat, WindowIdConstants.HeartbeatInterval, mainWindow);
+ 
+@@ -240,20 +250,25 @@ class RemoteTerminalBackend extends BaseTerminalBackend implements ITerminalBack
+ 		};
+ 		const activeWorkspaceRootUri = getWorkspaceForTerminal(shellLaunchConfig.cwd, this._workspaceContextService, this._historyService)?.uri;
+ 
+-		const result = await this._remoteTerminalChannel.createProcess(
+-			shellLaunchConfigDto,
+-			configuration,
+-			activeWorkspaceRootUri,
+-			options,
+-			shouldPersist,
+-			cols,
+-			rows,
+-			unicodeVersion,
+-			this._windowId
+-		);
+-		const pty = this._instantiationService.createInstance(RemotePty, result.persistentTerminalId, shouldPersist, this._remoteTerminalChannel, this._windowId);
+-		this._trackPty(result.persistentTerminalId, pty);
+-		return pty;
++		this._pendingAttaches++;
++		try {
++			const result = await this._remoteTerminalChannel.createProcess(
++				shellLaunchConfigDto,
++				configuration,
++				activeWorkspaceRootUri,
++				options,
++				shouldPersist,
++				cols,
++				rows,
++				unicodeVersion,
++				this._windowId
++			);
++			const pty = this._instantiationService.createInstance(RemotePty, result.persistentTerminalId, shouldPersist, this._remoteTerminalChannel, this._windowId);
++			this._trackPty(result.persistentTerminalId, pty);
++			return pty;
++		} finally {
++			this._pendingAttaches--;
++		}
+ 	}
+ 
+ 	async attachToProcess(id: number): Promise<ITerminalChildProcess | undefined> {
+@@ -261,13 +276,16 @@ class RemoteTerminalBackend extends BaseTerminalBackend implements ITerminalBack
+ 			throw new Error(`Cannot create remote terminal when there is no remote!`);
+ 		}
+ 
++		this._pendingAttaches++;
+ 		try {
+-			await this._remoteTerminalChannel.attachToProcess(id);
++			await this._remoteTerminalChannel.attachToProcess(id, this._windowId);
+ 			const pty = this._instantiationService.createInstance(RemotePty, id, true, this._remoteTerminalChannel, this._windowId);
+ 			this._trackPty(id, pty);
+ 			return pty;
+ 		} catch (e) {
+ 			this._logService.trace(`Couldn't attach to process ${e.message}`);
++		} finally {
++			this._pendingAttaches--;
+ 		}
+ 		return undefined;
+ 	}
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalActions.ts b/src/vs/workbench/contrib/terminal/browser/terminalActions.ts
+index ced3b318..dd488bd5 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalActions.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalActions.ts
+@@ -52,7 +52,8 @@ import { IWorkbenchEnvironmentService } from '../../../services/environment/comm
+ import { IPreferencesService } from '../../../services/preferences/common/preferences.js';
+ import { IRemoteAgentService } from '../../../services/remote/common/remoteAgentService.js';
+ import { accessibleViewCurrentProviderId, accessibleViewIsShown, accessibleViewOnLastLine } from '../../accessibility/browser/accessibilityConfiguration.js';
+-import { IRemoteTerminalAttachTarget, ITerminalProfileResolverService, ITerminalProfileService, TERMINAL_VIEW_ID, TerminalCommandId } from '../common/terminal.js';
++import { ITerminalProfileResolverService, ITerminalProfileService, TERMINAL_VIEW_ID, TerminalCommandId } from '../common/terminal.js';
++import { IProcessDetails } from '../../../../platform/terminal/common/terminalProcess.js';
+ import { TerminalContextKeys } from '../common/terminalContextKey.js';
+ import { terminalStrings } from '../common/terminalStrings.js';
+ import { Direction, ICreateTerminalOptions, IDetachedTerminalInstance, ITerminalConfigurationService, ITerminalEditorService, ITerminalEditingService, ITerminalGroupService, ITerminalInstance, ITerminalInstanceService, ITerminalService, IXtermTerminal } from './terminal.js';
+@@ -62,7 +63,7 @@ import { getColorClass, getIconId, getUriClasses } from './terminalIcon.js';
+ import { killTerminalIcon, newTerminalIcon } from './terminalIcons.js';
+ import { ITerminalQuickPickItem } from './terminalProfileQuickpick.js';
+ import { TerminalTabList } from './terminalTabsList.js';
+-import { ResourceContextKey } from '../../../common/contextkeys.js';
++import { RemoteNameContext, ResourceContextKey } from '../../../common/contextkeys.js';
+ import { SeparatorSelectOption } from '../../../../base/browser/ui/selectBox/selectBox.js';
+ 
+ export const switchTerminalShowTabsTitle = localize('showTerminalTabs', "Show Tabs");
+@@ -848,46 +849,14 @@ export function registerTerminalActions() {
+ 	registerTerminalAction({
+ 		id: TerminalCommandId.AttachToSession,
+ 		title: localize2('workbench.action.terminal.attachToSession', 'Attach to Session'),
+-		run: async (c, accessor) => {
+-			const quickInputService = accessor.get(IQuickInputService);
+-			const labelService = accessor.get(ILabelService);
+-			const remoteAgentService = accessor.get(IRemoteAgentService);
+-			const notificationService = accessor.get(INotificationService);
+-
+-			const remoteAuthority = remoteAgentService.getConnection()?.remoteAuthority ?? undefined;
+-			const backend = await accessor.get(ITerminalInstanceService).getBackend(remoteAuthority);
+-
+-			if (!backend) {
+-				throw new Error(`No backend registered for remote authority '${remoteAuthority}'`);
+-			}
+-
+-			const terms = await backend.listProcesses();
+-
+-			backend.reduceConnectionGraceTime();
++		run: (c, accessor) => pickRemoteTerminal(c, accessor, false)
++	});
+ 
+-			const unattachedTerms = terms.filter(term => !c.service.isAttachedToTerminal(term));
+-			const items = unattachedTerms.map(term => {
+-				const cwdLabel = labelService.getUriLabel(URI.file(term.cwd));
+-				return {
+-					label: term.title,
+-					detail: term.workspaceName ? `${term.workspaceName} \u2E31 ${cwdLabel}` : cwdLabel,
+-					description: term.pid ? String(term.pid) : '',
+-					term
+-				};
+-			});
+-			if (items.length === 0) {
+-				notificationService.info(localize('noUnattachedTerminals', 'There are no unattached terminals to attach to'));
+-				return;
+-			}
+-			const selected = await quickInputService.pick<IRemoteTerminalPick>(items, { canPickMany: false });
+-			if (selected) {
+-				const instance = await c.service.createTerminal({
+-					config: { attachPersistentProcess: selected.term }
+-				});
+-				c.service.setActiveInstance(instance);
+-				await focusActiveTerminal(instance, c);
+-			}
+-		}
++	registerTerminalAction({
++		id: TerminalCommandId.ShowRemoteTerminals,
++		title: localize2('workbench.action.terminal.showRemoteTerminals', 'Show Remote Terminals'),
++		precondition: ContextKeyExpr.and(sharedWhenClause.terminalAvailable, RemoteNameContext.notEqualsTo('')),
++		run: (c, accessor) => pickRemoteTerminal(c, accessor, true)
+ 	});
+ 
+ 	registerActiveInstanceAction({
+@@ -1469,7 +1438,65 @@ export function registerTerminalActions() {
+ }
+ 
+ interface IRemoteTerminalPick extends IQuickPickItem {
+-	term: IRemoteTerminalAttachTarget;
++	term: IProcessDetails;
++}
++
++/**
++ * Lists the pty host's terminals. With {@link showAll} it also lists the ones this window shows,
++ * with their lifetime and how many windows show them; picking one focuses or attaches it.
++ */
++async function pickRemoteTerminal(c: ITerminalServicesCollection, accessor: ServicesAccessor, showAll: boolean): Promise<void> {
++	const quickInputService = accessor.get(IQuickInputService);
++	const labelService = accessor.get(ILabelService);
++	const remoteAgentService = accessor.get(IRemoteAgentService);
++	const notificationService = accessor.get(INotificationService);
++
++	const remoteAuthority = remoteAgentService.getConnection()?.remoteAuthority ?? undefined;
++	const backend = await accessor.get(ITerminalInstanceService).getBackend(remoteAuthority);
++
++	if (!backend) {
++		throw new Error(`No backend registered for remote authority '${remoteAuthority}'`);
++	}
++
++	const terms = await backend.listProcesses();
++
++	backend.reduceConnectionGraceTime();
++
++	const shownTerms = showAll ? terms : terms.filter(term => !c.service.isAttachedToTerminal(term));
++	const items = shownTerms.map(term => {
++		const cwdLabel = labelService.getUriLabel(URI.file(term.cwd));
++		const description: string[] = [];
++		if (term.lifetime) {
++			description.push(term.lifetime.lifetime === TerminalLifetime.Persistent ? localize('remoteTerminalPersistent', "persistent") : localize('remoteTerminalWindowOwned', "window-owned"));
++			description.push(localize('remoteTerminalViews', "{0} window(s)", term.lifetime.viewCount ?? 0));
++		}
++		if (c.service.isAttachedToTerminal(term)) {
++			description.push(localize('remoteTerminalShownHere', "shown here"));
++		}
++		if (term.pid) {
++			description.push(String(term.pid));
++		}
++		return {
++			label: term.title,
++			detail: term.workspaceName ? `${term.workspaceName} ⸱ ${cwdLabel}` : cwdLabel,
++			description: description.join(' · '),
++			term
++		};
++	});
++	if (items.length === 0) {
++		notificationService.info(showAll ? localize('noRemoteTerminals', 'There are no remote terminals') : localize('noUnattachedTerminals', 'There are no unattached terminals to attach to'));
++		return;
++	}
++	const selected = await quickInputService.pick<IRemoteTerminalPick>(items, { canPickMany: false });
++	if (!selected) {
++		return;
++	}
++	const existing = c.service.instances.find(instance => instance.processId === selected.term.pid);
++	const instance = existing ?? await c.service.createTerminal({
++		config: { attachPersistentProcess: selected.term }
++	});
++	c.service.setActiveInstance(instance);
++	await focusActiveTerminal(instance, c);
+ }
+ 
+ function getSelectedViewInstances2(accessor: ServicesAccessor, args?: unknown): ITerminalInstance[] | undefined {
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts b/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+index e7ee9c87..c396f135 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+@@ -1260,6 +1260,7 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
+ 			this._onDidBlur.fire(this);
+ 			this._refreshSelectionContextKey();
+ 		}
++		this._reportViewState();
+ 	}
+ 
+ 	private _setShellIntegrationContextKey(): void {
+@@ -1456,6 +1457,7 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
+ 		}
+ 		if (didChange) {
+ 			this._onDidChangeVisibility.fire(visible);
++			this._reportViewState();
+ 		}
+ 	}
+ 
+@@ -1617,8 +1619,23 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
+ 		return processManager;
+ 	}
+ 
++	/**
++	 * Tells the pty host what this window's view could show, for terminals it shares between
++	 * windows. Uses the container's own size, not the size the shared grid overrides it with.
++	 */
++	private _reportViewState(): void {
++		if (!this._lifetime || this.isDisposed || this._cols <= 0 || this._rows <= 0) {
++			return;
++		}
++		this._processManager.setViewState({ cols: this._cols, rows: this._rows, visible: this._isVisible, focused: this.hasFocus });
++	}
++
+ 	private _handleLifetimeChange(info: ITerminalLifetimeInfo): void {
++		const isFirst = !this._lifetime;
+ 		this._lifetime = info;
++		if (isFirst) {
++			this._reportViewState();
++		}
+ 		if (info.lifetime === TerminalLifetime.Persistent) {
+ 			this.statusList.add({
+ 				id: TerminalStatus.Lifetime,
+@@ -2122,6 +2139,7 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
+ 
+ 		TerminalInstance._lastKnownGridDimensions = { cols, rows };
+ 		this._resizeDebouncer?.resize(cols, rows, immediate ?? false);
++		this._reportViewState();
+ 	}
+ 
+ 	private async _updatePtyDimensions(rawXterm: XTermTerminal): Promise<void> {
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalProcessManager.ts b/src/vs/workbench/contrib/terminal/browser/terminalProcessManager.ts
+index 1fb41206..dc740008 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalProcessManager.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalProcessManager.ts
+@@ -18,7 +18,7 @@ import { ITelemetryService } from '../../../../platform/telemetry/common/telemet
+ import { ISerializedCommandDetectionCapability, TerminalCapability } from '../../../../platform/terminal/common/capabilities/capabilities.js';
+ import { NaiveCwdDetectionCapability } from '../../../../platform/terminal/common/capabilities/naiveCwdDetectionCapability.js';
+ import { TerminalCapabilityStore } from '../../../../platform/terminal/common/capabilities/terminalCapabilityStore.js';
+-import { FlowControlConstants, ITerminalLaunchResult, IProcessDataEvent, IProcessProperty, IProcessPropertyMap, IProcessReadyEvent, IReconnectionProperties, IShellLaunchConfig, ITerminalBackend, ITerminalChildProcess, ITerminalDimensions, ITerminalEnvironment, ITerminalLaunchError, ITerminalLogService, ITerminalProcessOptions, ProcessPropertyType, TerminalSettingId } from '../../../../platform/terminal/common/terminal.js';
++import { FlowControlConstants, ITerminalViewState, ITerminalLaunchResult, IProcessDataEvent, IProcessProperty, IProcessPropertyMap, IProcessReadyEvent, IReconnectionProperties, IShellLaunchConfig, ITerminalBackend, ITerminalChildProcess, ITerminalDimensions, ITerminalEnvironment, ITerminalLaunchError, ITerminalLogService, ITerminalProcessOptions, ProcessPropertyType, TerminalSettingId } from '../../../../platform/terminal/common/terminal.js';
+ import { TerminalRecorder } from '../../../../platform/terminal/common/terminalRecorder.js';
+ import { IWorkspaceContextService, IWorkspaceFolder } from '../../../../platform/workspace/common/workspace.js';
+ import { EnvironmentVariableInfoChangesActive, EnvironmentVariableInfoStale } from './environmentVariableInfo.js';
+@@ -618,6 +618,10 @@ export class TerminalProcessManager extends Disposable implements ITerminalProce
+ 		return this.ptyProcessReady.then(() => this._resize(cols, rows, pixelWidth, pixelHeight));
+ 	}
+ 
++	setViewState(state: ITerminalViewState): void {
++		this._process?.setViewState?.(state);
++	}
++
+ 	async setUnicodeVersion(version: '6' | '11'): Promise<void> {
+ 		return this._process?.setUnicodeVersion(version);
+ 	}
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalService.ts b/src/vs/workbench/contrib/terminal/browser/terminalService.ts
+index 3f297431..8c3d3a62 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalService.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalService.ts
+@@ -14,6 +14,7 @@ import { isMacintosh, isWeb } from '../../../../base/common/platform.js';
+ import { URI } from '../../../../base/common/uri.js';
+ import { IKeyMods } from '../../../../platform/quickinput/common/quickInput.js';
+ import * as nls from '../../../../nls.js';
++import Severity from '../../../../base/common/severity.js';
+ import { ICommandService } from '../../../../platform/commands/common/commands.js';
+ import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+ import { IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
+@@ -428,6 +429,25 @@ export class TerminalService extends Disposable implements ITerminalService {
+ 	}
+ 
+ 	async safeDisposeTerminal(instance: ITerminalInstance): Promise<void> {
++		// Another window shows this terminal too: closing it here may only mean hiding it here
++		if ((instance.lifetime?.viewCount ?? 0) > 1) {
++			const { result } = await this._dialogService.prompt<'everywhere' | 'here' | undefined>({
++				type: Severity.Warning,
++				message: nls.localize('terminalShownElsewhere', "This terminal is also open in another window."),
++				detail: nls.localize('terminalShownElsewhereDetail', "Closing it ends its shell for every window. Remove it from this window only to keep it running."),
++				buttons: [
++					{ label: nls.localize({ key: 'closeHere', comment: ['&& denotes a mnemonic'] }, "&&Remove From This Window"), run: () => 'here' },
++					{ label: nls.localize({ key: 'closeEverywhere', comment: ['&& denotes a mnemonic'] }, "&&Close Everywhere"), run: () => 'everywhere' },
++				],
++				cancelButton: { run: () => undefined },
++			});
++			if (result === undefined) {
++				return;
++			}
++			if (result === 'here') {
++				return instance.detachProcessAndDispose(TerminalExitReason.User);
++			}
++		}
+ 		// Confirm on kill in the editor is handled by the editor input
+ 		if (instance.target !== TerminalLocation.Editor &&
+ 			instance.hasChildProcesses &&
+diff --git a/src/vs/workbench/contrib/terminal/common/basePty.ts b/src/vs/workbench/contrib/terminal/common/basePty.ts
+index 9a4a05ac..c5386eab 100644
+--- a/src/vs/workbench/contrib/terminal/common/basePty.ts
++++ b/src/vs/workbench/contrib/terminal/common/basePty.ts
+@@ -88,6 +88,10 @@ export abstract class BasePty extends Disposable implements Partial<ITerminalChi
+ 		}
+ 		this._onDidChangeProperty.fire({ type, value });
+ 	}
++	protected _getOverrideAfterReplay(): IProcessPropertyMap[ProcessPropertyType.OverrideDimensions] {
++		return undefined;
++	}
++
+ 	async handleReplay(e: IPtyHostProcessReplayEvent) {
+ 		mark(`code/terminal/willHandleReplay/${this.id}`);
+ 		try {
+@@ -109,8 +113,9 @@ export abstract class BasePty extends Disposable implements Partial<ITerminalChi
+ 			this._onRestoreCommands.fire(e.commands);
+ 		}
+ 
+-		// remove size override
+-		this._onDidChangeProperty.fire({ type: ProcessPropertyType.OverrideDimensions, value: undefined });
++		// remove size override, or switch straight to the one the backend wants after the replay:
++		// resizing in between would reflow the replayed content
++		this._onDidChangeProperty.fire({ type: ProcessPropertyType.OverrideDimensions, value: this._getOverrideAfterReplay() });
+ 
+ 		mark(`code/terminal/didHandleReplay/${this.id}`);
+ 		this._onProcessReplayComplete.fire();
+diff --git a/src/vs/workbench/contrib/terminal/common/remote/remoteTerminalChannel.ts b/src/vs/workbench/contrib/terminal/common/remote/remoteTerminalChannel.ts
+index fe95d94a..2ad25d30 100644
+--- a/src/vs/workbench/contrib/terminal/common/remote/remoteTerminalChannel.ts
++++ b/src/vs/workbench/contrib/terminal/common/remote/remoteTerminalChannel.ts
+@@ -17,7 +17,7 @@ import { IEditorService } from '../../../../services/editor/common/editorService
+ import { Schemas } from '../../../../../base/common/network.js';
+ import { ILabelService } from '../../../../../platform/label/common/label.js';
+ import { IEnvironmentVariableService } from '../environmentVariable.js';
+-import { IProcessDataEvent, IRequestResolveVariablesEvent, IShellLaunchConfigDto, ITerminalLaunchError, ITerminalProfile, ITerminalsLayoutInfo, ITerminalsLayoutInfoById, TerminalIcon, IProcessProperty, ProcessPropertyType, IProcessPropertyMap, TitleEventSource, ISerializedTerminalState, IPtyHostController, ITerminalProcessOptions, IProcessReadyEvent, ITerminalLogService, IPtyHostLatencyMeasurement, ITerminalLaunchResult, TerminalLifetime } from '../../../../../platform/terminal/common/terminal.js';
++import { IProcessDataEvent, IRequestResolveVariablesEvent, IShellLaunchConfigDto, ITerminalLaunchError, ITerminalProfile, ITerminalsLayoutInfo, ITerminalsLayoutInfoById, TerminalIcon, IProcessProperty, ProcessPropertyType, IProcessPropertyMap, TitleEventSource, ISerializedTerminalState, IPtyHostController, ITerminalProcessOptions, IProcessReadyEvent, ITerminalLogService, IPtyHostLatencyMeasurement, ITerminalLaunchResult, ITerminalViewState, TerminalLifetime } from '../../../../../platform/terminal/common/terminal.js';
+ import { IGetTerminalLayoutInfoArgs, IProcessDetails, ISetTerminalLayoutInfoArgs } from '../../../../../platform/terminal/common/terminalProcess.js';
+ import { IProcessEnvironment, OperatingSystem } from '../../../../../base/common/platform.js';
+ import { ICompleteTerminalConfiguration } from '../terminal.js';
+@@ -87,8 +87,8 @@ export class RemoteTerminalChannelClient implements IPtyHostController {
+ 	get onProcessReady(): Event<{ id: number; event: IProcessReadyEvent }> {
+ 		return this._channel.listen<{ id: number; event: IProcessReadyEvent }>(RemoteTerminalChannelEvent.OnProcessReadyEvent);
+ 	}
+-	get onProcessReplay(): Event<{ id: number; event: IPtyHostProcessReplayEvent }> {
+-		return this._channel.listen<{ id: number; event: IPtyHostProcessReplayEvent }>(RemoteTerminalChannelEvent.OnProcessReplayEvent);
++	get onProcessReplay(): Event<{ id: number; event: IPtyHostProcessReplayEvent; windowId?: string }> {
++		return this._channel.listen<{ id: number; event: IPtyHostProcessReplayEvent; windowId?: string }>(RemoteTerminalChannelEvent.OnProcessReplayEvent);
+ 	}
+ 	get onProcessOrphanQuestion(): Event<{ id: number }> {
+ 		return this._channel.listen<{ id: number }>(RemoteTerminalChannelEvent.OnProcessOrphanQuestion);
+@@ -201,17 +201,20 @@ export class RemoteTerminalChannelClient implements IPtyHostController {
+ 	acceptDetachInstanceReply(requestId: number, persistentProcessId: number): Promise<void> {
+ 		return this._channel.call(RemoteTerminalChannelRequest.AcceptDetachInstanceReply, [requestId, persistentProcessId]);
+ 	}
+-	attachToProcess(id: number): Promise<void> {
+-		return this._channel.call(RemoteTerminalChannelRequest.AttachToProcess, [id]);
++	attachToProcess(id: number, windowId?: string): Promise<void> {
++		return this._channel.call(RemoteTerminalChannelRequest.AttachToProcess, [id, windowId]);
+ 	}
+-	detachFromProcess(id: number, forcePersist?: boolean): Promise<void> {
+-		return this._channel.call(RemoteTerminalChannelRequest.DetachFromProcess, [id, forcePersist]);
++	detachFromProcess(id: number, forcePersist?: boolean, windowId?: string): Promise<void> {
++		return this._channel.call(RemoteTerminalChannelRequest.DetachFromProcess, [id, forcePersist, windowId]);
++	}
++	setViewState(id: number, windowId: string, state: ITerminalViewState): Promise<void> {
++		return this._channel.call(RemoteTerminalChannelRequest.SetViewState, [id, windowId, state]);
+ 	}
+ 	setLifetime(id: number, lifetime: TerminalLifetime, windowId: string): Promise<void> {
+ 		return this._channel.call(RemoteTerminalChannelRequest.SetLifetime, [id, lifetime, windowId]);
+ 	}
+-	windowHeartbeat(windowId: string): Promise<void> {
+-		return this._channel.call(RemoteTerminalChannelRequest.WindowHeartbeat, [windowId]);
++	windowHeartbeat(windowId: string, attachedIds?: number[]): Promise<void> {
++		return this._channel.call(RemoteTerminalChannelRequest.WindowHeartbeat, [windowId, attachedIds]);
+ 	}
+ 	listProcesses(): Promise<IProcessDetails[]> {
+ 		return this._channel.call(RemoteTerminalChannelRequest.ListProcesses);
+@@ -228,11 +231,11 @@ export class RemoteTerminalChannelClient implements IPtyHostController {
+ 	processBinary(id: number, data: string): Promise<void> {
+ 		return this._channel.call(RemoteTerminalChannelRequest.ProcessBinary, [id, data]);
+ 	}
+-	start(id: number): Promise<ITerminalLaunchError | ITerminalLaunchResult | undefined> {
+-		return this._channel.call(RemoteTerminalChannelRequest.Start, [id]);
++	start(id: number, windowId?: string): Promise<ITerminalLaunchError | ITerminalLaunchResult | undefined> {
++		return this._channel.call(RemoteTerminalChannelRequest.Start, [id, windowId]);
+ 	}
+-	input(id: number, data: string): Promise<void> {
+-		return this._channel.call(RemoteTerminalChannelRequest.Input, [id, data]);
++	input(id: number, data: string, windowId?: string): Promise<void> {
++		return this._channel.call(RemoteTerminalChannelRequest.Input, [id, data, windowId]);
+ 	}
+ 	sendSignal(id: number, signal: string): Promise<void> {
+ 		return this._channel.call(RemoteTerminalChannelRequest.SendSignal, [id, signal]);
+diff --git a/src/vs/workbench/contrib/terminal/common/remote/terminal.ts b/src/vs/workbench/contrib/terminal/common/remote/terminal.ts
+index 37ec33cb..b6506e07 100644
+--- a/src/vs/workbench/contrib/terminal/common/remote/terminal.ts
++++ b/src/vs/workbench/contrib/terminal/common/remote/terminal.ts
+@@ -104,4 +104,5 @@ export const enum RemoteTerminalChannelRequest {
+ 	FreePortKillProcess = '$freePortKillProcess',
+ 	SetLifetime = '$setLifetime',
+ 	WindowHeartbeat = '$windowHeartbeat',
++	SetViewState = '$setViewState',
+ }
+diff --git a/src/vs/workbench/contrib/terminal/common/terminal.ts b/src/vs/workbench/contrib/terminal/common/terminal.ts
+index aa5eea1e..c16f775b 100644
+--- a/src/vs/workbench/contrib/terminal/common/terminal.ts
++++ b/src/vs/workbench/contrib/terminal/common/terminal.ts
+@@ -14,7 +14,7 @@ import * as nls from '../../../../nls.js';
+ import { createDecorator } from '../../../../platform/instantiation/common/instantiation.js';
+ import { ISerializedCommandDetectionCapability, ITerminalCapabilityStore } from '../../../../platform/terminal/common/capabilities/capabilities.js';
+ import { IMergedEnvironmentVariableCollection } from '../../../../platform/terminal/common/environmentVariable.js';
+-import { ICreateContributedTerminalProfileOptions, IExtensionTerminalProfile, IFixedTerminalDimensions, ITerminalLaunchResult, IProcessDataEvent, IProcessProperty, IProcessPropertyMap, IProcessReadyEvent, IProcessReadyWindowsPty, IShellLaunchConfig, ITerminalBackend, ITerminalContributions, ITerminalEnvironment, ITerminalLaunchError, ITerminalProfile, ITerminalProfileObject, ITerminalTabAction, ProcessPropertyType, TerminalIcon, TerminalLocationConfigValue, TitleEventSource } from '../../../../platform/terminal/common/terminal.js';
++import { ICreateContributedTerminalProfileOptions, IExtensionTerminalProfile, IFixedTerminalDimensions, ITerminalViewState, ITerminalLaunchResult, IProcessDataEvent, IProcessProperty, IProcessPropertyMap, IProcessReadyEvent, IProcessReadyWindowsPty, IShellLaunchConfig, ITerminalBackend, ITerminalContributions, ITerminalEnvironment, ITerminalLaunchError, ITerminalProfile, ITerminalProfileObject, ITerminalTabAction, ProcessPropertyType, TerminalIcon, TerminalLocationConfigValue, TitleEventSource } from '../../../../platform/terminal/common/terminal.js';
+ import { AccessibilityCommandId } from '../../accessibility/common/accessibilityCommands.js';
+ import { IEnvironmentVariableInfo } from './environmentVariable.js';
+ import { IExtensionPointDescriptor } from '../../../services/extensions/common/extensionsRegistry.js';
+@@ -308,6 +308,8 @@ export interface ITerminalProcessManager extends IDisposable, ITerminalProcessIn
+ 	setDimensions(cols: number, rows: number, sync?: undefined, pixelWidth?: number, pixelHeight?: number): Promise<void>;
+ 	setDimensions(cols: number, rows: number, sync: false, pixelWidth?: number, pixelHeight?: number): Promise<void>;
+ 	setDimensions(cols: number, rows: number, sync: true, pixelWidth?: number, pixelHeight?: number): void;
++	/** Reports this window's view of the terminal to a backend that shares the grid between windows. */
++	setViewState(state: ITerminalViewState): void;
+ 	clearBuffer(): Promise<void>;
+ 	setUnicodeVersion(version: '6' | '11'): Promise<void>;
+ 	setNextCommandId(commandLine: string, commandId: string): Promise<void>;
+@@ -487,6 +489,7 @@ export const enum TerminalCommandId {
+ 	SendSequence = 'workbench.action.terminal.sendSequence',
+ 	SendSignal = 'workbench.action.terminal.sendSignal',
+ 	AttachToSession = 'workbench.action.terminal.attachToSession',
++	ShowRemoteTerminals = 'workbench.action.terminal.showRemoteTerminals',
+ 	DetachSession = 'workbench.action.terminal.detachSession',
+ 	MakePersistent = 'workbench.action.terminal.makePersistent',
+ 	MakeWindowOwned = 'workbench.action.terminal.makeWindowOwned',

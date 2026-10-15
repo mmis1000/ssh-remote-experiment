@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mmis1000 <mmis10002@gmail.com>
+Date: Thu, 15 Oct 2026 19:35:33 +0800
+Subject: [PATCH] Add remote.SSH.devServerCommit for clients run from source
+
+---
+ package.json                           | 6 ++++++
+ src/server-config/get-server-config.ts | 4 +++-
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/package.json b/package.json
+index 5d5ed08..9a1e2ba 100644
+--- a/package.json
++++ b/package.json
+@@ -176,6 +176,12 @@
+ 					"description": "The URL from where the vscode server will be downloaded. You can use the following variables and they will be replaced dynamically:\n- ${quality}: vscode server quality, e.g. stable or insiders\n- ${version}: vscode server version, e.g. 1.69.0\n- ${commit}: vscode server release commit\n- ${arch}: vscode server arch, e.g. x64, armhf, arm64\n- ${release}: release number, vscodium only https://github.com/VSCodium/vscodium/pull/1192",
+ 					"scope": "application"
+ 				},
++				"remote.SSH.devServerCommit": {
++					"type": "string",
++					"default": "",
++					"description": "Server commit to use when the client's product.json has no commit, which is the case for a client run from source. The server must already be installed under that commit on the remote.",
++					"scope": "application"
++				},
+ 				"remote.SSH.remotePlatform": {
+ 					"type": "object",
+ 					"description": "A map of the remote hostname to the platform for that remote. Valid values: linux, macos, windows.",
+diff --git a/src/server-config/get-server-config.ts b/src/server-config/get-server-config.ts
+index 3dd7ae5..8d61a0c 100644
+--- a/src/server-config/get-server-config.ts
++++ b/src/server-config/get-server-config.ts
+@@ -8,10 +8,12 @@ export async function getServerConfig(): Promise<IServerConfig> {
+ 
+     const customServerBinaryName = vscode.workspace.getConfiguration('remote.SSH').get<string>('serverBinaryName', '');
+     const serverValidation = vscode.workspace.getConfiguration('remote.SSH').get<ServerValidation>('serverValidation', 'strict');
++    // A client run from source has no commit in product.json
++    const devServerCommit = vscode.workspace.getConfiguration('remote.SSH').get<string>('devServerCommit', '');
+ 
+     return {
+         version: vscode.version.replace('-insider',''),
+-        commit: productJson.commit as string,
++        commit: (productJson.commit as string | undefined) || devServerCommit,
+         quality: productJson.quality as string,
+         release: productJson.release as string || '',
+         serverApplicationName: customServerBinaryName || productJson.serverApplicationName as string,

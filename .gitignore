@@ -1,0 +1,9 @@
+# Upstream clones, pinned in upstream.env; changes to them live in patches/
+/vscodium/
+/open-remote-ssh/
+# Local dev client profile and logs
+/.dev-profile/
+*.log
+.client-*.log
+poc/*.out
+poc/*.png

@@ -1,0 +1,6 @@
+# SSH config used only by the dev client's Open Remote SSH (remote.SSH.configFile).
+Host nas-poc
+  HostName nas
+  Port 2222
+  User root
+  IdentityFile ~/.ssh/id_ecdsa

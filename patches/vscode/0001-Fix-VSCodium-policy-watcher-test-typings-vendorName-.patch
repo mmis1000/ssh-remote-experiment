@@ -1,0 +1,32 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mmis1000 <mmis10002@gmail.com>
+Date: Thu, 15 Oct 2026 18:38:33 +0800
+Subject: [PATCH 1/5] Fix VSCodium policy-watcher test typings (vendorName
+ param)
+
+---
+ .../policy/test/node/nativeManagedSettingsService.test.ts     | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/vs/platform/policy/test/node/nativeManagedSettingsService.test.ts b/src/vs/platform/policy/test/node/nativeManagedSettingsService.test.ts
+index 8b7a4334..d79924d1 100644
+--- a/src/vs/platform/policy/test/node/nativeManagedSettingsService.test.ts
++++ b/src/vs/platform/policy/test/node/nativeManagedSettingsService.test.ts
+@@ -72,7 +72,7 @@ suite('NativeManagedSettingsService', () => {
+ 	for (const leaf of ['prompts', 'responses', 'toolArguments', 'toolOutput', 'policyDetail']) {
+ 		test(`native capture.${leaf} selects telemetry without a corresponding Local capture policy`, async () => {
+ 			const key = `telemetry.capture.${leaf}`;
+-			const watcherFactory: NativePolicyWatcherFactory = (_productName, policies, callback) => {
++			const watcherFactory: NativePolicyWatcherFactory = (_venderName, _productName, policies, callback) => {
+ 				assert.deepStrictEqual(policies[key], { type: 'boolean' });
+ 				callback({ [key]: false });
+ 				return Disposable.None;
+@@ -88,7 +88,7 @@ suite('NativeManagedSettingsService', () => {
+ 	test('without observed declared telemetry keys, native delivery leaves the server block active', async () => {
+ 		let onDidChange: ((update: Record<string, PolicyValue | undefined>) => void) | undefined;
+ 		const key = 'telemetry.capture.prompts';
+-		const watcherFactory: NativePolicyWatcherFactory = (_productName, policies, callback) => {
++		const watcherFactory: NativePolicyWatcherFactory = (_venderName, _productName, policies, callback) => {
+ 			assert.deepStrictEqual({
+ 				block: policies.telemetry,
+ 				unknown: policies['telemetry.futureControl'],

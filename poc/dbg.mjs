@@ -1,0 +1,15 @@
+import { createRequire } from 'node:module';
+const require = createRequire('C:/Playground/ssh-persistant/vscodium/vscode/package.json');
+const { chromium } = require('playwright-core');
+const b = await chromium.connectOverCDP('http://127.0.0.1:9333');
+const p = b.contexts().flatMap(c => c.pages()).find(p => p.url().includes('workbench'));
+await p.bringToFront();
+await p.click('.monaco-workbench .part.editor', { position: { x: 200, y: 200 } }).catch(e => console.log('click', e.message));
+await p.keyboard.press('F1');
+await p.waitForTimeout(800);
+console.log(await p.evaluate(() => { const q = document.querySelector('.quick-input-widget'); return q ? q.style.display + ' ' + (document.activeElement?.className) : 'no widget'; }));
+await p.keyboard.type('Terminal: Create New Terminal', { delay: 5 });
+await p.waitForTimeout(800);
+console.log(await p.evaluate(() => [...document.querySelectorAll('.quick-input-widget .monaco-list-row')].slice(0, 3).map(r => r.getAttribute('aria-label'))));
+await p.screenshot({ path: 'poc/shot-dbg.png' });
+process.exit(0);

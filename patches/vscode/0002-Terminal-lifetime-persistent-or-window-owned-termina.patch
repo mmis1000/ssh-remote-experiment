@@ -1,0 +1,957 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mmis1000 <mmis10002@gmail.com>
+Date: Thu, 15 Oct 2026 20:15:27 +0800
+Subject: [PATCH 2/5] Terminal lifetime: persistent or window-owned terminals
+ on the remote pty host
+
+- Pty host tracks windows by heartbeat; a window-owned terminal ends a grace
+  period after its owner window goes away, Reload Window keeps it.
+- Persistent terminals ignore the reconnection grace timers and keep the
+  server from auto-shutting down (PtyHostKeepAlive).
+- Make Persistent / Make Window-owned commands and a tab status marker.
+- A window forgets a pty when it detaches, so it stops answering the orphan
+  question for terminals it no longer shows.
+- Remote terminals are no longer revived from a saved buffer, which started
+  duplicate shells next to the running ones.
+---
+ src/vs/platform/terminal/common/terminal.ts   |  37 +++++-
+ .../terminal/common/terminalProcess.ts        |   4 +-
+ .../platform/terminal/node/ptyHostService.ts  |  15 ++-
+ src/vs/platform/terminal/node/ptyService.ts   | 117 +++++++++++++++++-
+ .../platform/terminal/node/terminalProcess.ts |   1 +
+ src/vs/server/node/ptyHostKeepAlive.ts        |  60 +++++++++
+ src/vs/server/node/remoteTerminalChannel.ts   |   4 +-
+ src/vs/server/node/serverServices.ts          |   2 +
+ .../contrib/terminal/browser/remotePty.ts     |  21 +++-
+ .../terminal/browser/remoteTerminalBackend.ts |  72 ++++++++---
+ .../terminal/browser/terminalActions.ts       |  24 +++-
+ .../terminal/browser/terminalInstance.ts      |  30 ++++-
+ .../contrib/terminal/browser/terminalMenus.ts |  22 ++++
+ .../terminal/browser/terminalStatusList.ts    |   3 +-
+ .../contrib/terminal/common/basePty.ts        |   1 +
+ .../common/remote/remoteTerminalChannel.ts    |  14 ++-
+ .../terminal/common/remote/terminal.ts        |   4 +
+ .../contrib/terminal/common/terminal.ts       |   2 +
+ 18 files changed, 403 insertions(+), 30 deletions(-)
+ create mode 100644 src/vs/server/node/ptyHostKeepAlive.ts
+
+diff --git a/src/vs/platform/terminal/common/terminal.ts b/src/vs/platform/terminal/common/terminal.ts
+index 7503771a..6752bbaa 100644
+--- a/src/vs/platform/terminal/common/terminal.ts
++++ b/src/vs/platform/terminal/common/terminal.ts
+@@ -267,6 +267,7 @@ export const enum ProcessPropertyType {
+ 	FailedShellIntegrationActivation = 'failedShellIntegrationActivation',
+ 	UsedShellIntegrationInjection = 'usedShellIntegrationInjection',
+ 	ShellIntegrationInjectionFailureReason = 'shellIntegrationInjectionFailureReason',
++	Lifetime = 'lifetime',
+ }
+ 
+ export interface IProcessProperty<T extends ProcessPropertyType = ProcessPropertyType> {
+@@ -286,6 +287,25 @@ export interface IProcessPropertyMap {
+ 	[ProcessPropertyType.FailedShellIntegrationActivation]: boolean | undefined;
+ 	[ProcessPropertyType.UsedShellIntegrationInjection]: boolean | undefined;
+ 	[ProcessPropertyType.ShellIntegrationInjectionFailureReason]: ShellIntegrationInjectionFailureReason | undefined;
++	[ProcessPropertyType.Lifetime]: ITerminalLifetimeInfo | undefined;
++}
++
++/**
++ * How long a terminal on the pty host lives, independent of which windows show it.
++ */
++export const enum TerminalLifetime {
++	/** Runs until its shell exits or someone closes it. */
++	Persistent = 'persistent',
++	/** Ends a grace period after its owner window goes away. */
++	WindowOwned = 'windowOwned',
++}
++
++export interface ITerminalLifetimeInfo {
++	lifetime: TerminalLifetime;
++	/** The window whose departure ends a window-owned terminal. */
++	ownerWindowId: string | undefined;
++	/** Filled in by the window receiving the info: whether it is the owner. */
++	ownedByThisWindow?: boolean;
+ }
+ 
+ export interface IFixedTerminalDimensions {
+@@ -329,11 +349,24 @@ export interface IPtyService {
+ 		options: ITerminalProcessOptions,
+ 		shouldPersist: boolean,
+ 		workspaceId: string,
+-		workspaceName: string
++		workspaceName: string,
++		isReviving?: boolean,
++		rawReviveBuffer?: string,
++		ownerWindowId?: string
+ 	): Promise<number>;
+ 	attachToProcess(id: number): Promise<void>;
+ 	detachFromProcess(id: number, forcePersist?: boolean): Promise<void>;
+ 	shutdownAll(): Promise<void>;
++	/**
++	 * Changes a terminal's lifetime. Making it window-owned sets {@link windowId} as the owner.
++	 * Only implemented by pty hosts that track windows (the remote server).
++	 */
++	setLifetime?(id: number, lifetime: TerminalLifetime, windowId: string): Promise<void>;
++	/**
++	 * Tells the pty host that a window is still connected. A window that stops sending these is
++	 * treated as gone and the terminals it owns start their grace period.
++	 */
++	windowHeartbeat?(windowId: string): Promise<void>;
+ 
+ 	/**
+ 	 * Lists all orphaned processes, ie. those without a connected frontend.
+@@ -1184,6 +1217,8 @@ export interface ITerminalBackend extends ITerminalBackendPtyServiceContribution
+ 	requestDetachInstance(workspaceId: string, instanceId: number): Promise<IProcessDetails | undefined>;
+ 	acceptDetachInstanceReply(requestId: number, persistentProcessId?: number): Promise<void>;
+ 	persistTerminalState(): Promise<void>;
++	/** Changes a terminal's lifetime; window-owned makes this window the owner. Remote only. */
++	setLifetime?(id: number, lifetime: TerminalLifetime): Promise<void>;
+ 
+ 	createProcess(
+ 		shellLaunchConfig: IShellLaunchConfig,
+diff --git a/src/vs/platform/terminal/common/terminalProcess.ts b/src/vs/platform/terminal/common/terminalProcess.ts
+index 28408eef..68d9b1e7 100644
+--- a/src/vs/platform/terminal/common/terminalProcess.ts
++++ b/src/vs/platform/terminal/common/terminalProcess.ts
+@@ -5,7 +5,7 @@
+ 
+ import { UriComponents } from '../../../base/common/uri.js';
+ import { ISerializableEnvironmentVariableCollection, ISerializableEnvironmentVariableCollections } from './environmentVariable.js';
+-import { IFixedTerminalDimensions, IRawTerminalTabLayoutInfo, IReconnectionProperties, ITerminalEnvironment, ITerminalTabAction, ITerminalTabLayoutInfoById, TerminalIcon, TerminalType, TitleEventSource, WaitOnExitValue } from './terminal.js';
++import { IFixedTerminalDimensions, ITerminalLifetimeInfo, IRawTerminalTabLayoutInfo, IReconnectionProperties, ITerminalEnvironment, ITerminalTabAction, ITerminalTabLayoutInfoById, TerminalIcon, TerminalType, TitleEventSource, WaitOnExitValue } from './terminal.js';
+ 
+ export interface ISingleTerminalConfiguration<T> {
+ 	userValue: T | undefined;
+@@ -60,6 +60,8 @@ export interface IProcessDetails {
+ 	hasChildProcesses: boolean;
+ 	shellIntegrationNonce: string;
+ 	tabActions?: ITerminalTabAction[];
++	/** Set for terminals whose lifetime the pty host manages (remote, persistent sessions). */
++	lifetime?: ITerminalLifetimeInfo;
+ }
+ 
+ export type ITerminalTabLayoutInfoDto = IRawTerminalTabLayoutInfo<IProcessDetails>;
+diff --git a/src/vs/platform/terminal/node/ptyHostService.ts b/src/vs/platform/terminal/node/ptyHostService.ts
+index 3ac9cdb8..8602e61a 100644
+--- a/src/vs/platform/terminal/node/ptyHostService.ts
++++ b/src/vs/platform/terminal/node/ptyHostService.ts
+@@ -13,7 +13,7 @@ import { RemoteLoggerChannelClient } from '../../log/common/logIpc.js';
+ import { getResolvedShellEnv } from '../../shell/node/shellEnv.js';
+ import { IPtyHostProcessReplayEvent } from '../common/capabilities/capabilities.js';
+ import { RequestStore } from '../common/requestStore.js';
+-import { HeartbeatConstants, IHeartbeatService, ITerminalLaunchResult, IProcessDataEvent, IProcessProperty, IProcessPropertyMap, IProcessReadyEvent, IPtyHostLatencyMeasurement, IPtyHostService, IPtyService, IRequestResolveVariablesEvent, ISerializedTerminalState, IShellLaunchConfig, ITerminalLaunchError, ITerminalProcessOptions, ITerminalProfile, ITerminalsLayoutInfo, ProcessPropertyType, TerminalIcon, TerminalIpcChannels, TerminalSettingId, TitleEventSource } from '../common/terminal.js';
++import { HeartbeatConstants, IHeartbeatService, ITerminalLaunchResult, IProcessDataEvent, IProcessProperty, IProcessPropertyMap, IProcessReadyEvent, IPtyHostLatencyMeasurement, IPtyHostService, IPtyService, IRequestResolveVariablesEvent, ISerializedTerminalState, IShellLaunchConfig, ITerminalLaunchError, ITerminalProcessOptions, ITerminalProfile, ITerminalsLayoutInfo, ProcessPropertyType, TerminalIcon, TerminalIpcChannels, TerminalLifetime, TerminalSettingId, TitleEventSource } from '../common/terminal.js';
+ import { registerTerminalPlatformConfiguration } from '../common/terminalPlatformConfiguration.js';
+ import { IGetTerminalLayoutInfoArgs, IProcessDetails, ISetTerminalLayoutInfoArgs } from '../common/terminalProcess.js';
+ import { IPtyHostConnection, IPtyHostStarter } from './ptyHost.js';
+@@ -207,10 +207,13 @@ export class PtyHostService extends Disposable implements IPtyHostService {
+ 		options: ITerminalProcessOptions,
+ 		shouldPersist: boolean,
+ 		workspaceId: string,
+-		workspaceName: string
++		workspaceName: string,
++		isReviving?: boolean,
++		rawReviveBuffer?: string,
++		ownerWindowId?: string
+ 	): Promise<number> {
+ 		const timeout = setTimeout(() => this._handleUnresponsiveCreateProcess(), HeartbeatConstants.CreateProcessTimeout);
+-		const id = await this._proxy.createProcess(shellLaunchConfig, cwd, cols, rows, unicodeVersion, env, executableEnv, options, shouldPersist, workspaceId, workspaceName);
++		const id = await this._proxy.createProcess(shellLaunchConfig, cwd, cols, rows, unicodeVersion, env, executableEnv, options, shouldPersist, workspaceId, workspaceName, isReviving, rawReviveBuffer, ownerWindowId);
+ 		clearTimeout(timeout);
+ 		return id;
+ 	}
+@@ -226,6 +229,12 @@ export class PtyHostService extends Disposable implements IPtyHostService {
+ 	detachFromProcess(id: number, forcePersist?: boolean): Promise<void> {
+ 		return this._proxy.detachFromProcess(id, forcePersist);
+ 	}
++	async setLifetime(id: number, lifetime: TerminalLifetime, windowId: string): Promise<void> {
++		return this._proxy.setLifetime?.(id, lifetime, windowId);
++	}
++	async windowHeartbeat(windowId: string): Promise<void> {
++		return this._proxy.windowHeartbeat?.(windowId);
++	}
+ 	shutdownAll(): Promise<void> {
+ 		return this._proxy.shutdownAll();
+ 	}
+diff --git a/src/vs/platform/terminal/node/ptyService.ts b/src/vs/platform/terminal/node/ptyService.ts
+index 476664d1..99dc21ae 100644
+--- a/src/vs/platform/terminal/node/ptyService.ts
++++ b/src/vs/platform/terminal/node/ptyService.ts
+@@ -12,7 +12,7 @@ import { URI } from '../../../base/common/uri.js';
+ import { getSystemShell } from '../../../base/node/shell.js';
+ import { ILogService, LogLevel } from '../../log/common/log.js';
+ import { RequestStore } from '../common/requestStore.js';
+-import { IProcessDataEvent, IProcessReadyEvent, IPtyService, IRawTerminalInstanceLayoutInfo, IReconnectConstants, IShellLaunchConfig, ITerminalInstanceLayoutInfoById, ITerminalLaunchError, ITerminalsLayoutInfo, ITerminalTabLayoutInfoById, TerminalIcon, IProcessProperty, TitleEventSource, ProcessPropertyType, IProcessPropertyMap, IFixedTerminalDimensions, IPersistentTerminalProcessLaunchConfig, ICrossVersionSerializedTerminalState, ISerializedTerminalState, ITerminalProcessOptions, IPtyHostLatencyMeasurement, type IPtyServiceContribution, PosixShellType, ITerminalLaunchResult } from '../common/terminal.js';
++import { IProcessDataEvent, IProcessReadyEvent, IPtyService, IRawTerminalInstanceLayoutInfo, IReconnectConstants, IShellLaunchConfig, ITerminalInstanceLayoutInfoById, ITerminalLaunchError, ITerminalsLayoutInfo, ITerminalTabLayoutInfoById, TerminalIcon, IProcessProperty, TitleEventSource, ProcessPropertyType, IProcessPropertyMap, IFixedTerminalDimensions, IPersistentTerminalProcessLaunchConfig, ICrossVersionSerializedTerminalState, ISerializedTerminalState, ITerminalProcessOptions, IPtyHostLatencyMeasurement, type IPtyServiceContribution, PosixShellType, ITerminalLaunchResult, ITerminalLifetimeInfo, TerminalLifetime } from '../common/terminal.js';
+ import { TerminalDataBufferer } from '../common/terminalDataBuffering.js';
+ import { escapeNonWindowsPath } from '../common/terminalEnvironment.js';
+ import type { ISerializeOptions, SerializeAddon as XtermSerializeAddon } from '@xterm/addon-serialize';
+@@ -91,6 +91,13 @@ export function traceRpc(_target: Object, key: string, descriptor: PropertyDescr
+ 
+ type WorkspaceId = string;
+ 
++const enum WindowLifetimeConstants {
++	/** How often the pty host checks for windows that stopped sending heartbeats. */
++	CheckInterval = 5000,
++	/** A window that has not sent a heartbeat for this long is treated as gone. */
++	WindowTimeout = 30000,
++}
++
+ let SerializeAddon: typeof XtermSerializeAddon;
+ let Unicode11Addon: typeof XtermUnicode11Addon;
+ 
+@@ -101,6 +108,11 @@ export class PtyService extends Disposable implements IPtyService {
+ 	private readonly _workspaceLayoutInfos = new Map<WorkspaceId, ISetTerminalLayoutInfoArgs>();
+ 	private readonly _detachInstanceRequestStore: RequestStore<IProcessDetails | undefined, { workspaceId: string; instanceId: number }>;
+ 	private readonly _revivedPtyIdMap: Map<string, { newId: number; state: ISerializedTerminalState }> = new Map();
++	/** Time of the last heartbeat from each window that has talked to this pty host. */
++	private readonly _windowLastSeen = new Map<string, number>();
++	/** Windows whose heartbeats stopped; the window-owned terminals they own are in their grace period. */
++	private readonly _goneWindows = new Set<string>();
++	private readonly _ownerGraceTime: number;
+ 
+ 	// #region Pty service contribution RPC calls
+ 
+@@ -177,6 +189,48 @@ export class PtyService extends Disposable implements IPtyService {
+ 
+ 		this._contributions = [this._autoRepliesContribution];
+ 
++		const ownerGraceOverride = Number(process.env['VSCODE_TERMINAL_OWNER_GRACE_TIME']);
++		this._ownerGraceTime = ownerGraceOverride > 0 ? ownerGraceOverride : this._reconnectConstants.shortGraceTime;
++		const windowCheck = setInterval(() => this._checkWindows(), WindowLifetimeConstants.CheckInterval);
++		this._register(toDisposable(() => clearInterval(windowCheck)));
++	}
++
++	@traceRpc
++	async windowHeartbeat(windowId: string): Promise<void> {
++		this._windowLastSeen.set(windowId, Date.now());
++		if (this._goneWindows.delete(windowId)) {
++			this._logService.info(`Window ${windowId} is back, cancelling the grace period of the terminals it owns`);
++			for (const pty of this._ptys.values()) {
++				if (pty.lifetime?.ownerWindowId === windowId) {
++					pty.cancelOwnerGrace();
++				}
++			}
++		}
++	}
++
++	@traceRpc
++	async setLifetime(id: number, lifetime: TerminalLifetime, windowId: string): Promise<void> {
++		const pty = this._throwIfNoPty(id);
++		await this.windowHeartbeat(windowId);
++		const ownerWindowId = lifetime === TerminalLifetime.WindowOwned ? windowId : pty.lifetime?.ownerWindowId;
++		pty.setLifetime({ lifetime, ownerWindowId }, this._ownerGraceTime);
++		this._logService.info(`Persistent process "${id}": lifetime set to ${lifetime} by window ${windowId}, owner ${ownerWindowId}`);
++	}
++
++	private _checkWindows(): void {
++		const now = Date.now();
++		for (const [windowId, lastSeen] of this._windowLastSeen) {
++			if (this._goneWindows.has(windowId) || now - lastSeen < WindowLifetimeConstants.WindowTimeout) {
++				continue;
++			}
++			this._goneWindows.add(windowId);
++			this._logService.info(`Window ${windowId} stopped sending heartbeats, starting the grace period of the terminals it owns`);
++			for (const pty of this._ptys.values()) {
++				if (pty.lifetime?.ownerWindowId === windowId) {
++					pty.startOwnerGrace();
++				}
++			}
++		}
+ 	}
+ 
+ 	@traceRpc
+@@ -328,7 +382,8 @@ export class PtyService extends Disposable implements IPtyService {
+ 		workspaceId: string,
+ 		workspaceName: string,
+ 		isReviving?: boolean,
+-		rawReviveBuffer?: string
++		rawReviveBuffer?: string,
++		ownerWindowId?: string
+ 	): Promise<number> {
+ 		if (shellLaunchConfig.attachPersistentProcess) {
+ 			throw new Error('Attempt to create a process when attach object was provided');
+@@ -360,6 +415,10 @@ export class PtyService extends Disposable implements IPtyService {
+ 			}
+ 		});
+ 		this._ptys.set(id, persistentProcess);
++		if (shouldPersist && ownerWindowId) {
++			await this.windowHeartbeat(ownerWindowId);
++			persistentProcess.setLifetime({ lifetime: TerminalLifetime.WindowOwned, ownerWindowId }, this._ownerGraceTime);
++		}
+ 		return id;
+ 	}
+ 
+@@ -660,7 +719,8 @@ export class PtyService extends Disposable implements IPtyService {
+ 			type: persistentProcess.shellLaunchConfig.type,
+ 			hasChildProcesses: persistentProcess.hasChildProcesses,
+ 			shellIntegrationNonce: persistentProcess.processLaunchOptions.options.shellIntegration.nonce,
+-			tabActions: persistentProcess.shellLaunchConfig.tabActions
++			tabActions: persistentProcess.shellLaunchConfig.tabActions,
++			lifetime: persistentProcess.lifetime
+ 		};
+ 		performance.mark(`code/didBuildProcessDetails/${id}`);
+ 		return result;
+@@ -698,6 +758,8 @@ class PersistentTerminalProcess extends Disposable {
+ 	private _orphanRequestQueue = new Queue<boolean>();
+ 	private _disconnectRunner1: ProcessTimeRunOnceScheduler;
+ 	private _disconnectRunner2: ProcessTimeRunOnceScheduler;
++	private _lifetime: ITerminalLifetimeInfo | undefined;
++	private _ownerGraceRunner: ProcessTimeRunOnceScheduler | undefined;
+ 
+ 	private readonly _onProcessReplay = this._register(new Emitter<IPtyHostProcessReplayEvent>());
+ 	readonly onProcessReplay = this._onProcessReplay.event;
+@@ -732,6 +794,7 @@ class PersistentTerminalProcess extends Disposable {
+ 	get color(): string | undefined { return this._color; }
+ 	get fixedDimensions(): IFixedTerminalDimensions | undefined { return this._fixedDimensions; }
+ 	get hasChildProcesses(): boolean { return this._terminalProcess.hasChildProcesses; }
++	get lifetime(): ITerminalLifetimeInfo | undefined { return this._lifetime; }
+ 
+ 	setTitle(title: string, titleSource: TitleEventSource): void {
+ 		if (titleSource === TitleEventSource.Api) {
+@@ -823,7 +886,40 @@ class PersistentTerminalProcess extends Disposable {
+ 		this._register(this.onProcessData(e => this._serializer.handleData(e)));
+ 	}
+ 
++	/**
++	 * Gives the terminal a lifetime. From then on its lifetime decides when it ends, not the
++	 * reconnection grace timers: detaching or losing a connection no longer schedules a shutdown.
++	 */
++	setLifetime(lifetime: ITerminalLifetimeInfo, ownerGraceTime: number): void {
++		this._lifetime = lifetime;
++		this._disconnectRunner1.cancel();
++		this._disconnectRunner2.cancel();
++		this.cancelOwnerGrace();
++		this._ownerGraceRunner ??= this._register(new ProcessTimeRunOnceScheduler(() => {
++			this._logService.info(`Persistent process "${this._persistentProcessId}": owner window ${this._lifetime?.ownerWindowId} did not come back within ${printTime(ownerGraceTime)}, shutting down pid ${this._pid}`);
++			this.shutdown(true);
++		}, ownerGraceTime));
++		this._onDidChangeProperty.fire({ type: ProcessPropertyType.Lifetime, value: lifetime });
++	}
++
++	startOwnerGrace(): void {
++		if (this._lifetime?.lifetime === TerminalLifetime.WindowOwned && this._ownerGraceRunner && !this._ownerGraceRunner.isScheduled()) {
++			this._logService.info(`Persistent process "${this._persistentProcessId}": owner window ${this._lifetime.ownerWindowId} went away, starting grace period`);
++			this._ownerGraceRunner.schedule();
++		}
++	}
++
++	cancelOwnerGrace(): void {
++		if (this._ownerGraceRunner?.isScheduled()) {
++			this._logService.info(`Persistent process "${this._persistentProcessId}": grace period cancelled`);
++			this._ownerGraceRunner.cancel();
++		}
++	}
++
+ 	async attach(): Promise<void> {
++		if (this._lifetime) {
++			return;
++		}
+ 		if (!this._disconnectRunner1.isScheduled() && !this._disconnectRunner2.isScheduled()) {
+ 			this._logService.warn(`Persistent process "${this._persistentProcessId}": Process had no disconnect runners but was an orphan`);
+ 		}
+@@ -832,6 +928,10 @@ class PersistentTerminalProcess extends Disposable {
+ 	}
+ 
+ 	async detach(forcePersist?: boolean): Promise<void> {
++		// Detaching only removes a view, the lifetime decides when the terminal ends
++		if (this._lifetime) {
++			return;
++		}
+ 		// Keep the process around if it was indicated to persist and it has had some iteraction or
+ 		// was replayed
+ 		if (this.shouldPersistTerminal && (this._interactionState.value !== InteractionState.None || forcePersist)) {
+@@ -874,15 +974,23 @@ class PersistentTerminalProcess extends Disposable {
+ 			} else {
+ 				this._onPersistentProcessReady.fire();
+ 			}
++			this._fireLifetime();
+ 			return result;
+ 		}
+ 
+ 		this._onProcessReady.fire({ pid: this._pid, cwd: this._cwd, windowsPty: this._terminalProcess.getWindowsPty() });
+ 		this._onDidChangeProperty.fire({ type: ProcessPropertyType.Title, value: this._terminalProcess.currentTitle });
+ 		this._onDidChangeProperty.fire({ type: ProcessPropertyType.ShellType, value: this._terminalProcess.shellType });
++		this._fireLifetime();
+ 		this.triggerReplay();
+ 		return undefined;
+ 	}
++
++	private _fireLifetime(): void {
++		if (this._lifetime) {
++			this._onDidChangeProperty.fire({ type: ProcessPropertyType.Lifetime, value: this._lifetime });
++		}
++	}
+ 	shutdown(immediate: boolean): void {
+ 		return this._terminalProcess.shutdown(immediate);
+ 	}
+@@ -974,6 +1082,9 @@ class PersistentTerminalProcess extends Disposable {
+ 	}
+ 
+ 	reduceGraceTime(): void {
++		if (this._lifetime) {
++			return;
++		}
+ 		if (this._disconnectRunner2.isScheduled()) {
+ 			// we are disconnected and already running the short reconnection timer
+ 			return;
+diff --git a/src/vs/platform/terminal/node/terminalProcess.ts b/src/vs/platform/terminal/node/terminalProcess.ts
+index d8d166dc..d486105f 100644
+--- a/src/vs/platform/terminal/node/terminalProcess.ts
++++ b/src/vs/platform/terminal/node/terminalProcess.ts
+@@ -98,6 +98,7 @@ export class TerminalProcess extends Disposable implements ITerminalChildProcess
+ 		failedShellIntegrationActivation: false,
+ 		usedShellIntegrationInjection: undefined,
+ 		shellIntegrationInjectionFailureReason: undefined,
++		lifetime: undefined,
+ 	};
+ 	private static _lastKillOrStart = 0;
+ 	private _exitCode: number | undefined;
+diff --git a/src/vs/server/node/ptyHostKeepAlive.ts b/src/vs/server/node/ptyHostKeepAlive.ts
+new file mode 100644
+index 00000000..0fe2f53c
+--- /dev/null
++++ b/src/vs/server/node/ptyHostKeepAlive.ts
+@@ -0,0 +1,60 @@
++/*---------------------------------------------------------------------------------------------
++ *  Copyright (c) Microsoft Corporation. All rights reserved.
++ *  Licensed under the MIT License. See License.txt in the project root for license information.
++ *--------------------------------------------------------------------------------------------*/
++
++import { Disposable, MutableDisposable } from '../../base/common/lifecycle.js';
++import { ILogService } from '../../platform/log/common/log.js';
++import { IProcessPropertyMap, IPtyHostService, ProcessPropertyType, TerminalLifetime } from '../../platform/terminal/common/terminal.js';
++import { IServerLifetimeService } from './serverLifetimeService.js';
++
++/**
++ * Keeps the server from auto-shutting down while the pty host has Persistent terminals, so they
++ * outlive every window. The pty host runs inside the server, so the server going idle would
++ * otherwise end them.
++ */
++export class PtyHostKeepAlive extends Disposable {
++	private readonly _persistentIds = new Set<number>();
++	private readonly _lifetimeToken = this._register(new MutableDisposable());
++
++	constructor(
++		ptyHostService: IPtyHostService,
++		private readonly _serverLifetimeService: IServerLifetimeService,
++		private readonly _logService: ILogService,
++	) {
++		super();
++		this._register(ptyHostService.onDidChangeProperty(e => {
++			if (e.property.type !== ProcessPropertyType.Lifetime) {
++				return;
++			}
++			const info = e.property.value as IProcessPropertyMap[ProcessPropertyType.Lifetime];
++			if (info?.lifetime === TerminalLifetime.Persistent) {
++				this._persistentIds.add(e.id);
++			} else {
++				this._persistentIds.delete(e.id);
++			}
++			this._update();
++		}));
++		this._register(ptyHostService.onProcessExit(e => {
++			if (this._persistentIds.delete(e.id)) {
++				this._update();
++			}
++		}));
++		this._register(ptyHostService.onPtyHostExit(() => {
++			this._persistentIds.clear();
++			this._update();
++		}));
++	}
++
++	private _update(): void {
++		if (this._persistentIds.size > 0) {
++			if (!this._lifetimeToken.value) {
++				this._logService.info(`PtyHostKeepAlive: ${this._persistentIds.size} persistent terminal(s), keeping the server alive`);
++				this._lifetimeToken.value = this._serverLifetimeService.active('PtyHost');
++			}
++		} else if (this._lifetimeToken.value) {
++			this._logService.info('PtyHostKeepAlive: no persistent terminals left, the server may shut down when idle');
++			this._lifetimeToken.clear();
++		}
++	}
++}
+diff --git a/src/vs/server/node/remoteTerminalChannel.ts b/src/vs/server/node/remoteTerminalChannel.ts
+index f2bbe6a4..8f06c3e4 100644
+--- a/src/vs/server/node/remoteTerminalChannel.ts
++++ b/src/vs/server/node/remoteTerminalChannel.ts
+@@ -163,6 +163,8 @@ export class RemoteTerminalChannel extends Disposable implements IServerChannel<
+ 			case RemoteTerminalChannelRequest.AcceptDetachedInstance: return this._ptyHostService.acceptDetachInstanceReply(args[0], args[1]);
+ 			case RemoteTerminalChannelRequest.FreePortKillProcess: return this._ptyHostService.freePortKillProcess.apply(this._ptyHostService, args);
+ 			case RemoteTerminalChannelRequest.AcceptDetachInstanceReply: return this._ptyHostService.acceptDetachInstanceReply.apply(this._ptyHostService, args);
++			case RemoteTerminalChannelRequest.SetLifetime: return this._ptyHostService.setLifetime?.(args[0], args[1], args[2]);
++			case RemoteTerminalChannelRequest.WindowHeartbeat: return this._ptyHostService.windowHeartbeat?.(args[0]);
+ 		}
+ 
+ 		// @ts-expect-error Assert command is the `never` type to ensure all messages are handled
+@@ -267,7 +269,7 @@ export class RemoteTerminalChannel extends Disposable implements IServerChannel<
+ 		const ipcHandlePath = createRandomIPCHandle();
+ 		env.VSCODE_IPC_HOOK_CLI = ipcHandlePath;
+ 
+-		const persistentProcessId = await this._ptyHostService.createProcess(shellLaunchConfig, initialCwd, args.cols, args.rows, args.unicodeVersion, env, baseEnv, args.options, args.shouldPersistTerminal, args.workspaceId, args.workspaceName);
++		const persistentProcessId = await this._ptyHostService.createProcess(shellLaunchConfig, initialCwd, args.cols, args.rows, args.unicodeVersion, env, baseEnv, args.options, args.shouldPersistTerminal, args.workspaceId, args.workspaceName, undefined, undefined, args.windowId);
+ 		const commandsExecuter: ICommandsExecuter = {
+ 			executeCommand: <T>(id: string, ...args: unknown[]): Promise<T> => this._executeCommand(persistentProcessId, id, args, uriTransformer)
+ 		};
+diff --git a/src/vs/server/node/serverServices.ts b/src/vs/server/node/serverServices.ts
+index 98fba790..02629da2 100644
+--- a/src/vs/server/node/serverServices.ts
++++ b/src/vs/server/node/serverServices.ts
+@@ -85,6 +85,7 @@ import { ServerAgentHostManager } from './serverAgentHostManager.js';
+ import { AgentHostChannel, UnavailableAgentHostChannel } from './agentHostChannel.js';
+ import { AgentHostIpcChannels } from '../../platform/agentHost/common/agentService.js';
+ import { IServerLifetimeService, ServerLifetimeService } from './serverLifetimeService.js';
++import { PtyHostKeepAlive } from './ptyHostKeepAlive.js';
+ import { CSSDevelopmentService, ICSSDevelopmentService } from '../../platform/cssDev/node/cssDevService.js';
+ import { AllowedExtensionsService } from '../../platform/extensionManagement/common/allowedExtensionsService.js';
+ import { TelemetryLogAppender } from '../../platform/telemetry/common/telemetryLogAppender.js';
+@@ -243,6 +244,7 @@ export async function setupServerServices(connectionToken: ServerConnectionToken
+ 		shutdownWithoutDelay: !!args['remote-auto-shutdown-without-delay'],
+ 	}, process.exit);
+ 	services.set(IServerLifetimeService, serverLifetimeService);
++	disposables.add(new PtyHostKeepAlive(ptyHostService, serverLifetimeService, logService));
+ 
+ 	// ---- Agent host wiring -------------------------------------------------
+ 	//
+diff --git a/src/vs/workbench/contrib/terminal/browser/remotePty.ts b/src/vs/workbench/contrib/terminal/browser/remotePty.ts
+index 68d16e84..bf7e4f82 100644
+--- a/src/vs/workbench/contrib/terminal/browser/remotePty.ts
++++ b/src/vs/workbench/contrib/terminal/browser/remotePty.ts
+@@ -4,7 +4,8 @@
+  *--------------------------------------------------------------------------------------------*/
+ 
+ import { Barrier } from '../../../../base/common/async.js';
+-import { ITerminalLaunchResult, IProcessPropertyMap, ITerminalChildProcess, ITerminalLaunchError, ITerminalLogService, ProcessPropertyType } from '../../../../platform/terminal/common/terminal.js';
++import { Emitter } from '../../../../base/common/event.js';
++import { ITerminalLaunchResult, IProcessProperty, IProcessPropertyMap, ITerminalChildProcess, ITerminalLaunchError, ITerminalLogService, ProcessPropertyType } from '../../../../platform/terminal/common/terminal.js';
+ import { BasePty } from '../common/basePty.js';
+ import { RemoteTerminalChannelClient } from '../common/remote/remoteTerminalChannel.js';
+ import { IRemoteAgentService } from '../../../services/remote/common/remoteAgentService.js';
+@@ -13,10 +14,15 @@ import { hasKey } from '../../../../base/common/types.js';
+ export class RemotePty extends BasePty implements ITerminalChildProcess {
+ 	private readonly _startBarrier: Barrier;
+ 
++	private readonly _onDidDetach = this._register(new Emitter<void>());
++	/** Fired once this window has left the process; it keeps running on the pty host. */
++	readonly onDidDetach = this._onDidDetach.event;
++
+ 	constructor(
+ 		id: number,
+ 		shouldPersist: boolean,
+ 		private readonly _remoteTerminalChannel: RemoteTerminalChannelClient,
++		private readonly _windowId: string | undefined,
+ 		@IRemoteAgentService private readonly _remoteAgentService: IRemoteAgentService,
+ 		@ITerminalLogService private readonly _logService: ITerminalLogService
+ 	) {
+@@ -47,7 +53,8 @@ export class RemotePty extends BasePty implements ITerminalChildProcess {
+ 
+ 	async detach(forcePersist?: boolean): Promise<void> {
+ 		await this._startBarrier.wait();
+-		return this._remoteTerminalChannel.detachFromProcess(this.id, forcePersist);
++		await this._remoteTerminalChannel.detachFromProcess(this.id, forcePersist);
++		this._onDidDetach.fire();
+ 	}
+ 
+ 	shutdown(immediate: boolean): void {
+@@ -125,6 +132,16 @@ export class RemotePty extends BasePty implements ITerminalChildProcess {
+ 		return this._remoteTerminalChannel.updateProperty(this.id, type, value);
+ 	}
+ 
++	override handleDidChangeProperty(property: IProcessProperty): void {
++		if (property.type === ProcessPropertyType.Lifetime) {
++			const info = property.value as IProcessPropertyMap[ProcessPropertyType.Lifetime];
++			if (info) {
++				property = { type: property.type, value: { ...info, ownedByThisWindow: !!this._windowId && info.ownerWindowId === this._windowId } };
++			}
++		}
++		super.handleDidChangeProperty(property);
++	}
++
+ 	handleOrphanQuestion() {
+ 		this._remoteTerminalChannel.orphanQuestionReply(this.id);
+ 	}
+diff --git a/src/vs/workbench/contrib/terminal/browser/remoteTerminalBackend.ts b/src/vs/workbench/contrib/terminal/browser/remoteTerminalBackend.ts
+index b03a5f2a..3d257d24 100644
+--- a/src/vs/workbench/contrib/terminal/browser/remoteTerminalBackend.ts
++++ b/src/vs/workbench/contrib/terminal/browser/remoteTerminalBackend.ts
+@@ -3,20 +3,22 @@
+  *  Licensed under the MIT License. See License.txt in the project root for license information.
+  *--------------------------------------------------------------------------------------------*/
+ 
+-import { DeferredPromise } from '../../../../base/common/async.js';
++import { DeferredPromise, IntervalTimer } from '../../../../base/common/async.js';
+ import { Emitter } from '../../../../base/common/event.js';
+ import { revive } from '../../../../base/common/marshalling.js';
+ import { PerformanceMark, mark } from '../../../../base/common/performance.js';
+ import { IProcessEnvironment, OperatingSystem } from '../../../../base/common/platform.js';
+ import { StopWatch } from '../../../../base/common/stopwatch.js';
++import { generateUuid } from '../../../../base/common/uuid.js';
++import { mainWindow } from '../../../../base/browser/window.js';
+ import { ICommandService } from '../../../../platform/commands/common/commands.js';
+ import { IConfigurationService } from '../../../../platform/configuration/common/configuration.js';
+ import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
+ import { Registry } from '../../../../platform/registry/common/platform.js';
+ import { IRemoteAuthorityResolverService } from '../../../../platform/remote/common/remoteAuthorityResolver.js';
+-import { IStorageService, StorageScope, StorageTarget } from '../../../../platform/storage/common/storage.js';
++import { IStorageService, StorageScope } from '../../../../platform/storage/common/storage.js';
+ import { ISerializedTerminalCommand } from '../../../../platform/terminal/common/capabilities/capabilities.js';
+-import { IPtyHostLatencyMeasurement, IShellLaunchConfig, IShellLaunchConfigDto, ITerminalBackend, ITerminalBackendRegistry, ITerminalChildProcess, ITerminalEnvironment, ITerminalLogService, ITerminalProcessOptions, ITerminalProfile, ITerminalsLayoutInfo, ITerminalsLayoutInfoById, ProcessPropertyType, TerminalExtensions, TerminalIcon, TerminalSettingId, TitleEventSource, type IProcessPropertyMap } from '../../../../platform/terminal/common/terminal.js';
++import { IPtyHostLatencyMeasurement, IShellLaunchConfig, IShellLaunchConfigDto, ITerminalBackend, ITerminalBackendRegistry, ITerminalChildProcess, ITerminalEnvironment, ITerminalLogService, ITerminalProcessOptions, ITerminalProfile, ITerminalsLayoutInfo, ITerminalsLayoutInfoById, ProcessPropertyType, TerminalExtensions, TerminalIcon, TerminalLifetime, TerminalSettingId, TitleEventSource, type IProcessPropertyMap } from '../../../../platform/terminal/common/terminal.js';
+ import { IProcessDetails } from '../../../../platform/terminal/common/terminalProcess.js';
+ import { IWorkspaceContextService } from '../../../../platform/workspace/common/workspace.js';
+ import { IWorkbenchContribution } from '../../../common/contributions.js';
+@@ -50,8 +52,32 @@ export class RemoteTerminalBackendContribution implements IWorkbenchContribution
+ 	}
+ }
+ 
++const enum WindowIdConstants {
++	StorageKey = 'vscode.remoteTerminal.windowId',
++	/** Must stay well below the pty host's window timeout (30s). */
++	HeartbeatInterval = 10000,
++}
++
++/**
++ * The id this window uses as a terminal owner. It is kept in session storage, so it survives
++ * Reload Window but a window opened later gets a new one.
++ */
++function getWindowId(): string {
++	try {
++		let id = mainWindow.sessionStorage.getItem(WindowIdConstants.StorageKey);
++		if (!id) {
++			id = generateUuid();
++			mainWindow.sessionStorage.setItem(WindowIdConstants.StorageKey, id);
++		}
++		return id;
++	} catch {
++		return generateUuid();
++	}
++}
++
+ class RemoteTerminalBackend extends BaseTerminalBackend implements ITerminalBackend {
+ 	private readonly _ptys: Map<number, RemotePty> = new Map();
++	private readonly _windowId = getWindowId();
+ 
+ 	private readonly _whenConnected = new DeferredPromise<void>();
+ 	get whenReady(): Promise<void> { return this._whenConnected.p; }
+@@ -121,9 +147,30 @@ class RemoteTerminalBackend extends BaseTerminalBackend implements ITerminalBack
+ 			}
+ 		}));
+ 
++		// Tell the pty host this window is still here, so the terminals it owns stay alive
++		const heartbeat = this._register(new IntervalTimer());
++		const beat = () => this._remoteTerminalChannel.windowHeartbeat(this._windowId).catch(e => this._logService.trace('Terminal window heartbeat failed', e));
++		beat();
++		heartbeat.cancelAndSet(beat, WindowIdConstants.HeartbeatInterval, mainWindow);
++
+ 		this._onPtyHostConnected.fire();
+ 	}
+ 
++	private _trackPty(id: number, pty: RemotePty): void {
++		this._ptys.set(id, pty);
++		// Forget the process once this window detaches, otherwise this window keeps answering the
++		// orphan question for a terminal it no longer shows
++		this._register(pty.onDidDetach(() => {
++			if (this._ptys.get(id) === pty) {
++				this._ptys.delete(id);
++			}
++		}));
++	}
++
++	async setLifetime(id: number, lifetime: TerminalLifetime): Promise<void> {
++		return this._remoteTerminalChannel.setLifetime(id, lifetime, this._windowId);
++	}
++
+ 	async requestDetachInstance(workspaceId: string, instanceId: number): Promise<IProcessDetails | undefined> {
+ 		if (!this._remoteTerminalChannel) {
+ 			throw new Error(`Cannot request detach instance when there is no remote!`);
+@@ -143,12 +190,8 @@ class RemoteTerminalBackend extends BaseTerminalBackend implements ITerminalBack
+ 	}
+ 
+ 	async persistTerminalState(): Promise<void> {
+-		if (!this._remoteTerminalChannel) {
+-			throw new Error(`Cannot persist terminal state when there is no remote!`);
+-		}
+-		const ids = Array.from(this._ptys.keys());
+-		const serialized = await this._remoteTerminalChannel.serializeTerminalState(ids);
+-		this._storageService.store(TerminalStorageKeys.TerminalBufferState, serialized, StorageScope.WORKSPACE, StorageTarget.MACHINE);
++		// Nothing to save: the server keeps remote terminals alive according to their lifetime, and
++		// reviving them from a saved buffer would start duplicate shells next to the running ones
+ 	}
+ 
+ 	async createProcess(
+@@ -205,10 +248,11 @@ class RemoteTerminalBackend extends BaseTerminalBackend implements ITerminalBack
+ 			shouldPersist,
+ 			cols,
+ 			rows,
+-			unicodeVersion
++			unicodeVersion,
++			this._windowId
+ 		);
+-		const pty = this._instantiationService.createInstance(RemotePty, result.persistentTerminalId, shouldPersist, this._remoteTerminalChannel);
+-		this._ptys.set(result.persistentTerminalId, pty);
++		const pty = this._instantiationService.createInstance(RemotePty, result.persistentTerminalId, shouldPersist, this._remoteTerminalChannel, this._windowId);
++		this._trackPty(result.persistentTerminalId, pty);
+ 		return pty;
+ 	}
+ 
+@@ -219,8 +263,8 @@ class RemoteTerminalBackend extends BaseTerminalBackend implements ITerminalBack
+ 
+ 		try {
+ 			await this._remoteTerminalChannel.attachToProcess(id);
+-			const pty = this._instantiationService.createInstance(RemotePty, id, true, this._remoteTerminalChannel);
+-			this._ptys.set(id, pty);
++			const pty = this._instantiationService.createInstance(RemotePty, id, true, this._remoteTerminalChannel, this._windowId);
++			this._trackPty(id, pty);
+ 			return pty;
+ 		} catch (e) {
+ 			this._logService.trace(`Couldn't attach to process ${e.message}`);
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalActions.ts b/src/vs/workbench/contrib/terminal/browser/terminalActions.ts
+index 4d881d9c..ced3b318 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalActions.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalActions.ts
+@@ -37,7 +37,7 @@ import { INotificationService, Severity } from '../../../../platform/notificatio
+ import { IOpenerService } from '../../../../platform/opener/common/opener.js';
+ import { IPickOptions, IQuickInputService, IQuickPickItem } from '../../../../platform/quickinput/common/quickInput.js';
+ import { TerminalCapability } from '../../../../platform/terminal/common/capabilities/capabilities.js';
+-import { ITerminalProfile, TerminalExitReason, TerminalIcon, TerminalLocation, TerminalSettingId } from '../../../../platform/terminal/common/terminal.js';
++import { ITerminalProfile, TerminalExitReason, TerminalIcon, TerminalLifetime, TerminalLocation, TerminalSettingId } from '../../../../platform/terminal/common/terminal.js';
+ import { createProfileSchemaEnums } from '../../../../platform/terminal/common/terminalProfiles.js';
+ import { IThemeService } from '../../../../platform/theme/common/themeService.js';
+ import { IWorkspaceContextService, IWorkspaceFolder } from '../../../../platform/workspace/common/workspace.js';
+@@ -228,6 +228,16 @@ export function registerContextualInstanceAction(
+  * A wrapper around {@link registerTerminalAction} that ensures an active instance exists and
+  * provides it to the run function.
+  */
++async function setTerminalLifetime(instance: ITerminalInstance, lifetime: TerminalLifetime, accessor: ServicesAccessor): Promise<void> {
++	const notificationService = accessor.get(INotificationService);
++	const backend = await accessor.get(ITerminalInstanceService).getBackend(instance.remoteAuthority);
++	if (!backend?.setLifetime || instance.persistentProcessId === undefined) {
++		notificationService.info(localize('terminalLifetimeUnsupported', "Only remote terminals with persistent sessions have a lifetime."));
++		return;
++	}
++	await backend.setLifetime(instance.persistentProcessId, lifetime);
++}
++
+ export function registerActiveInstanceAction(
+ 	options: IAction2Options & { run: (activeInstance: ITerminalInstance, c: ITerminalServicesCollection, accessor: ServicesAccessor, args?: unknown) => void | Promise<unknown> }
+ ): IDisposable {
+@@ -823,6 +833,18 @@ export function registerTerminalActions() {
+ 		run: (activeInstance) => activeInstance.detachProcessAndDispose(TerminalExitReason.User)
+ 	});
+ 
++	registerActiveInstanceAction({
++		id: TerminalCommandId.MakePersistent,
++		title: localize2('workbench.action.terminal.makePersistent', 'Make Persistent'),
++		run: (activeInstance, c, accessor) => setTerminalLifetime(activeInstance, TerminalLifetime.Persistent, accessor)
++	});
++
++	registerActiveInstanceAction({
++		id: TerminalCommandId.MakeWindowOwned,
++		title: localize2('workbench.action.terminal.makeWindowOwned', 'Make Window-owned'),
++		run: (activeInstance, c, accessor) => setTerminalLifetime(activeInstance, TerminalLifetime.WindowOwned, accessor)
++	});
++
+ 	registerTerminalAction({
+ 		id: TerminalCommandId.AttachToSession,
+ 		title: localize2('workbench.action.terminal.attachToSession', 'Attach to Session'),
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts b/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+index b1ed6ac5..2fb06fc9 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+@@ -46,7 +46,7 @@ import { IMarkProperties, TerminalCapability, type ICommandDetectionCapability }
+ import { TerminalCapabilityStoreMultiplexer } from '../../../../platform/terminal/common/capabilities/terminalCapabilityStore.js';
+ import { IEnvironmentVariableCollection, IMergedEnvironmentVariableCollection } from '../../../../platform/terminal/common/environmentVariable.js';
+ import { deserializeEnvironmentVariableCollections } from '../../../../platform/terminal/common/environmentVariableShared.js';
+-import { GeneralShellType, IProcessDataEvent, IProcessPropertyMap, IReconnectionProperties, IShellLaunchConfig, ITerminalDimensionsOverride, ITerminalLaunchError, ITerminalLogService, PosixShellType, ProcessPropertyType, remoteResolverTerminal, ShellIntegrationStatus, TerminalExitReason, TerminalIcon, TerminalLocation, TerminalSettingId, TerminalShellType, TitleEventSource, WindowsShellType, type ShellIntegrationInjectionFailureReason } from '../../../../platform/terminal/common/terminal.js';
++import { GeneralShellType, IProcessDataEvent, IProcessPropertyMap, ITerminalLifetimeInfo, TerminalLifetime, IReconnectionProperties, IShellLaunchConfig, ITerminalDimensionsOverride, ITerminalLaunchError, ITerminalLogService, PosixShellType, ProcessPropertyType, remoteResolverTerminal, ShellIntegrationStatus, TerminalExitReason, TerminalIcon, TerminalLocation, TerminalSettingId, TerminalShellType, TitleEventSource, WindowsShellType, type ShellIntegrationInjectionFailureReason } from '../../../../platform/terminal/common/terminal.js';
+ import { formatMessageForTerminal } from '../../../../platform/terminal/common/terminalStrings.js';
+ import { editorBackground } from '../../../../platform/theme/common/colorRegistry.js';
+ import { getIconRegistry } from '../../../../platform/theme/common/iconRegistry.js';
+@@ -1581,6 +1581,13 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
+ 				case ProcessPropertyType.ShellIntegrationInjectionFailureReason:
+ 					this._shellIntegrationInjectionInfo = value as IProcessPropertyMap[ProcessPropertyType.ShellIntegrationInjectionFailureReason];
+ 					break;
++				case ProcessPropertyType.Lifetime: {
++					const lifetime = value as IProcessPropertyMap[ProcessPropertyType.Lifetime];
++					if (lifetime) {
++						this._handleLifetimeChange(lifetime);
++					}
++					break;
++				}
+ 			}
+ 		}));
+ 
+@@ -1608,6 +1615,27 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
+ 		return processManager;
+ 	}
+ 
++	private _handleLifetimeChange(info: ITerminalLifetimeInfo): void {
++		if (info.lifetime === TerminalLifetime.Persistent) {
++			this.statusList.add({
++				id: TerminalStatus.Lifetime,
++				severity: Severity.Info,
++				icon: Codicon.pinned,
++				tooltip: nls.localize('lifetimePersistent', "Persistent: keeps running after every window closes, until its shell exits or it is closed")
++			});
++		} else if (!info.ownedByThisWindow) {
++			this.statusList.add({
++				id: TerminalStatus.Lifetime,
++				severity: Severity.Info,
++				icon: Codicon.window,
++				tooltip: nls.localize('lifetimeOtherWindow', "Window-owned by another window: ends shortly after that window closes, unless made persistent")
++			});
++		} else {
++			// Owned by this window, which is what a new terminal is: no marker
++			this.statusList.remove(TerminalStatus.Lifetime);
++		}
++	}
++
+ 	private async _createProcess(): Promise<void> {
+ 		if (this.isDisposed) {
+ 			return;
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalMenus.ts b/src/vs/workbench/contrib/terminal/browser/terminalMenus.ts
+index 576424a1..0bd2fce2 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalMenus.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalMenus.ts
+@@ -591,6 +591,28 @@ export function setupTerminalMenus(): void {
+ 
+ 	MenuRegistry.appendMenuItems(
+ 		[
++			{
++				id: MenuId.TerminalTabContext,
++				item: {
++					command: {
++						id: TerminalCommandId.MakePersistent,
++						title: localize('workbench.action.terminal.makePersistent', "Make Persistent")
++					},
++					group: TerminalContextMenuGroup.Edit,
++					when: ContextKeyExpr.notEquals('remoteName', '')
++				}
++			},
++			{
++				id: MenuId.TerminalTabContext,
++				item: {
++					command: {
++						id: TerminalCommandId.MakeWindowOwned,
++						title: localize('workbench.action.terminal.makeWindowOwned', "Make Window-owned")
++					},
++					group: TerminalContextMenuGroup.Edit,
++					when: ContextKeyExpr.notEquals('remoteName', '')
++				}
++			},
+ 			{
+ 				id: MenuId.TerminalTabContext,
+ 				item: {
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalStatusList.ts b/src/vs/workbench/contrib/terminal/browser/terminalStatusList.ts
+index 6c1111d7..8e76ba81 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalStatusList.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalStatusList.ts
+@@ -26,7 +26,8 @@ export const enum TerminalStatus {
+ 	RelaunchNeeded = 'relaunch-needed',
+ 	EnvironmentVariableInfoChangesActive = 'env-var-info-changes-active',
+ 	ShellIntegrationInfo = 'shell-integration-info',
+-	ShellIntegrationAttentionNeeded = 'shell-integration-attention-needed'
++	ShellIntegrationAttentionNeeded = 'shell-integration-attention-needed',
++	Lifetime = 'lifetime'
+ }
+ 
+ export interface ITerminalStatusList {
+diff --git a/src/vs/workbench/contrib/terminal/common/basePty.ts b/src/vs/workbench/contrib/terminal/common/basePty.ts
+index ace591d0..9a4a05ac 100644
+--- a/src/vs/workbench/contrib/terminal/common/basePty.ts
++++ b/src/vs/workbench/contrib/terminal/common/basePty.ts
+@@ -28,6 +28,7 @@ export abstract class BasePty extends Disposable implements Partial<ITerminalChi
+ 		failedShellIntegrationActivation: false,
+ 		usedShellIntegrationInjection: undefined,
+ 		shellIntegrationInjectionFailureReason: undefined,
++		lifetime: undefined,
+ 	};
+ 	protected readonly _lastDimensions: { cols: number; rows: number } = { cols: -1, rows: -1 };
+ 	protected _inReplay = false;
+diff --git a/src/vs/workbench/contrib/terminal/common/remote/remoteTerminalChannel.ts b/src/vs/workbench/contrib/terminal/common/remote/remoteTerminalChannel.ts
+index 6cdd9874..fe95d94a 100644
+--- a/src/vs/workbench/contrib/terminal/common/remote/remoteTerminalChannel.ts
++++ b/src/vs/workbench/contrib/terminal/common/remote/remoteTerminalChannel.ts
+@@ -17,7 +17,7 @@ import { IEditorService } from '../../../../services/editor/common/editorService
+ import { Schemas } from '../../../../../base/common/network.js';
+ import { ILabelService } from '../../../../../platform/label/common/label.js';
+ import { IEnvironmentVariableService } from '../environmentVariable.js';
+-import { IProcessDataEvent, IRequestResolveVariablesEvent, IShellLaunchConfigDto, ITerminalLaunchError, ITerminalProfile, ITerminalsLayoutInfo, ITerminalsLayoutInfoById, TerminalIcon, IProcessProperty, ProcessPropertyType, IProcessPropertyMap, TitleEventSource, ISerializedTerminalState, IPtyHostController, ITerminalProcessOptions, IProcessReadyEvent, ITerminalLogService, IPtyHostLatencyMeasurement, ITerminalLaunchResult } from '../../../../../platform/terminal/common/terminal.js';
++import { IProcessDataEvent, IRequestResolveVariablesEvent, IShellLaunchConfigDto, ITerminalLaunchError, ITerminalProfile, ITerminalsLayoutInfo, ITerminalsLayoutInfoById, TerminalIcon, IProcessProperty, ProcessPropertyType, IProcessPropertyMap, TitleEventSource, ISerializedTerminalState, IPtyHostController, ITerminalProcessOptions, IProcessReadyEvent, ITerminalLogService, IPtyHostLatencyMeasurement, ITerminalLaunchResult, TerminalLifetime } from '../../../../../platform/terminal/common/terminal.js';
+ import { IGetTerminalLayoutInfoArgs, IProcessDetails, ISetTerminalLayoutInfoArgs } from '../../../../../platform/terminal/common/terminalProcess.js';
+ import { IProcessEnvironment, OperatingSystem } from '../../../../../base/common/platform.js';
+ import { ICompleteTerminalConfiguration } from '../terminal.js';
+@@ -48,6 +48,8 @@ export interface ICreateTerminalProcessArguments {
+ 	activeWorkspaceFolder: IWorkspaceFolderData | null;
+ 	activeFileResource: UriComponents | undefined;
+ 	shouldPersistTerminal: boolean;
++	/** The window creating the terminal, which becomes its owner. */
++	windowId: string | undefined;
+ 	options: ITerminalProcessOptions;
+ 	cols: number;
+ 	rows: number;
+@@ -127,7 +129,8 @@ export class RemoteTerminalChannelClient implements IPtyHostController {
+ 		shouldPersistTerminal: boolean,
+ 		cols: number,
+ 		rows: number,
+-		unicodeVersion: '6' | '11'
++		unicodeVersion: '6' | '11',
++		windowId?: string
+ 	): Promise<ICreateTerminalProcessResult> {
+ 		// Be sure to first wait for the remote configuration
+ 		await this._configurationService.whenRemoteConfigurationLoaded();
+@@ -182,6 +185,7 @@ export class RemoteTerminalChannelClient implements IPtyHostController {
+ 			activeWorkspaceFolder,
+ 			activeFileResource,
+ 			shouldPersistTerminal,
++			windowId,
+ 			options,
+ 			cols,
+ 			rows,
+@@ -203,6 +207,12 @@ export class RemoteTerminalChannelClient implements IPtyHostController {
+ 	detachFromProcess(id: number, forcePersist?: boolean): Promise<void> {
+ 		return this._channel.call(RemoteTerminalChannelRequest.DetachFromProcess, [id, forcePersist]);
+ 	}
++	setLifetime(id: number, lifetime: TerminalLifetime, windowId: string): Promise<void> {
++		return this._channel.call(RemoteTerminalChannelRequest.SetLifetime, [id, lifetime, windowId]);
++	}
++	windowHeartbeat(windowId: string): Promise<void> {
++		return this._channel.call(RemoteTerminalChannelRequest.WindowHeartbeat, [windowId]);
++	}
+ 	listProcesses(): Promise<IProcessDetails[]> {
+ 		return this._channel.call(RemoteTerminalChannelRequest.ListProcesses);
+ 	}
+diff --git a/src/vs/workbench/contrib/terminal/common/remote/terminal.ts b/src/vs/workbench/contrib/terminal/common/remote/terminal.ts
+index fdf6140e..37ec33cb 100644
+--- a/src/vs/workbench/contrib/terminal/common/remote/terminal.ts
++++ b/src/vs/workbench/contrib/terminal/common/remote/terminal.ts
+@@ -29,6 +29,8 @@ export interface ICreateTerminalProcessArguments {
+ 	activeWorkspaceFolder: IWorkspaceFolderData | null;
+ 	activeFileResource: UriComponents | undefined;
+ 	shouldPersistTerminal: boolean;
++	/** The window creating the terminal, which becomes its owner. */
++	windowId: string | undefined;
+ 	options: ITerminalProcessOptions;
+ 	cols: number;
+ 	rows: number;
+@@ -100,4 +102,6 @@ export const enum RemoteTerminalChannelRequest {
+ 	AcceptDetachInstanceReply = '$acceptDetachInstanceReply',
+ 	AcceptDetachedInstance = '$acceptDetachedInstance',
+ 	FreePortKillProcess = '$freePortKillProcess',
++	SetLifetime = '$setLifetime',
++	WindowHeartbeat = '$windowHeartbeat',
+ }
+diff --git a/src/vs/workbench/contrib/terminal/common/terminal.ts b/src/vs/workbench/contrib/terminal/common/terminal.ts
+index 0532a062..aa5eea1e 100644
+--- a/src/vs/workbench/contrib/terminal/common/terminal.ts
++++ b/src/vs/workbench/contrib/terminal/common/terminal.ts
+@@ -488,6 +488,8 @@ export const enum TerminalCommandId {
+ 	SendSignal = 'workbench.action.terminal.sendSignal',
+ 	AttachToSession = 'workbench.action.terminal.attachToSession',
+ 	DetachSession = 'workbench.action.terminal.detachSession',
++	MakePersistent = 'workbench.action.terminal.makePersistent',
++	MakeWindowOwned = 'workbench.action.terminal.makeWindowOwned',
+ 	MoveToEditor = 'workbench.action.terminal.moveToEditor',
+ 	MoveToTerminalPanel = 'workbench.action.terminal.moveToTerminalPanel',
+ 	MoveIntoNewWindow = 'workbench.action.terminal.moveIntoNewWindow',

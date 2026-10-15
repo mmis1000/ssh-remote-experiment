@@ -1,0 +1,74 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mmis1000 <mmis10002@gmail.com>
+Date: Thu, 15 Oct 2026 20:24:40 +0800
+Subject: [PATCH 3/5] Detach lifetime-managed terminals when a window closes
+ instead of killing them
+
+---
+ src/vs/workbench/contrib/terminal/browser/terminal.ts     | 8 +++++++-
+ .../contrib/terminal/browser/terminalInstance.ts          | 3 +++
+ .../workbench/contrib/terminal/browser/terminalService.ts | 4 +++-
+ 3 files changed, 13 insertions(+), 2 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminal.ts b/src/vs/workbench/contrib/terminal/browser/terminal.ts
+index 156b980c..a825a5de 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminal.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminal.ts
+@@ -14,7 +14,7 @@ import { createDecorator } from '../../../../platform/instantiation/common/insta
+ import { IKeyMods } from '../../../../platform/quickinput/common/quickInput.js';
+ import { IMarkProperties, ITerminalCapabilityImplMap, ITerminalCapabilityStore, ITerminalCommand, TerminalCapability } from '../../../../platform/terminal/common/capabilities/capabilities.js';
+ import { IMergedEnvironmentVariableCollection } from '../../../../platform/terminal/common/environmentVariable.js';
+-import { IExtensionTerminalProfile, IReconnectionProperties, IShellIntegration, IShellLaunchConfig, ITerminalBackend, ITerminalDimensions, ITerminalLaunchError, ITerminalProfile, ITerminalTabLayoutInfoById, TerminalExitReason, TerminalIcon, TerminalLocation, TerminalShellType, TerminalType, TitleEventSource, WaitOnExitValue, type IDecorationAddon, type ShellIntegrationInjectionFailureReason } from '../../../../platform/terminal/common/terminal.js';
++import { IExtensionTerminalProfile, IReconnectionProperties, ITerminalLifetimeInfo, IShellIntegration, IShellLaunchConfig, ITerminalBackend, ITerminalDimensions, ITerminalLaunchError, ITerminalProfile, ITerminalTabLayoutInfoById, TerminalExitReason, TerminalIcon, TerminalLocation, TerminalShellType, TerminalType, TitleEventSource, WaitOnExitValue, type IDecorationAddon, type ShellIntegrationInjectionFailureReason } from '../../../../platform/terminal/common/terminal.js';
+ import { IColorTheme } from '../../../../platform/theme/common/themeService.js';
+ import { IWorkspaceFolder } from '../../../../platform/workspace/common/workspace.js';
+ import { EditorInput } from '../../../common/editor/editorInput.js';
+@@ -969,6 +969,12 @@ export interface ITerminalInstance extends IBaseTerminalInstance {
+ 	 */
+ 	readonly shouldPersist: boolean;
+ 
++	/**
++	 * Set when the pty host manages this terminal's lifetime (persistent or window-owned). Such a
++	 * terminal is detached rather than killed when the window closes.
++	 */
++	readonly lifetime?: ITerminalLifetimeInfo;
++
+ 	/*
+ 	 * Whether this terminal has been disposed of
+ 	 */
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts b/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+index 2fb06fc9..e7ee9c87 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+@@ -784,6 +784,8 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
+ 	}
+ 
+ 	get persistentProcessId(): number | undefined { return this._processManager.persistentProcessId; }
++	private _lifetime: ITerminalLifetimeInfo | undefined;
++	get lifetime(): ITerminalLifetimeInfo | undefined { return this._lifetime; }
+ 	get shouldPersist(): boolean { return this._processManager.shouldPersist && !this.shellLaunchConfig.isTransient && (!this.reconnectionProperties || this._configurationService.getValue('task.reconnection') === true); }
+ 
+ 	public static getXtermConstructor(keybindingService: IKeybindingService, contextKeyService: IContextKeyService) {
+@@ -1616,6 +1618,7 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
+ 	}
+ 
+ 	private _handleLifetimeChange(info: ITerminalLifetimeInfo): void {
++		this._lifetime = info;
+ 		if (info.lifetime === TerminalLifetime.Persistent) {
+ 			this.statusList.add({
+ 				id: TerminalStatus.Lifetime,
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalService.ts b/src/vs/workbench/contrib/terminal/browser/terminalService.ts
+index 83ac3261..3f297431 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalService.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalService.ts
+@@ -707,7 +707,9 @@ export class TerminalService extends Disposable implements ITerminalService {
+ 		const shouldPersistTerminals = this._terminalConfigurationService.config.enablePersistentSessions && e.reason === ShutdownReason.RELOAD;
+ 
+ 		for (const instance of [...this._terminalGroupService.instances, ...this._backgroundedTerminalInstances.map(bg => bg.instance)]) {
+-			if (shouldPersistTerminals && instance.shouldPersist) {
++			// Terminals whose lifetime the pty host manages outlive the window: its lifetime decides
++			// when they end, not the window closing
++			if ((shouldPersistTerminals || instance.lifetime) && instance.shouldPersist) {
+ 				instance.detachProcessAndDispose(TerminalExitReason.Shutdown);
+ 			} else {
+ 				instance.dispose(TerminalExitReason.Shutdown);
