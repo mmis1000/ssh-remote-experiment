@@ -1,0 +1,87 @@
+# Publishes https://mmis1000.me/ssh-remote-experiment from the releases the Server and Extension
+# workflows create. Each deploy replaces the whole site, so it is always rebuilt from the releases:
+#   reh/<commit>/vscodium-reh-linux-x64.tar.gz   the latest KEEP_BUILDS server builds (reh-<commit>)
+#   ors/open-remote-ssh.vsix                      the latest extension build (ors-<commit>)
+#   builds.json                                   { latest, builds, extension } for the extension and scripts
+
+name: Pages
+
+on:
+  workflow_run:
+    workflows: [Server, Extension]
+    types: [completed]
+  workflow_dispatch: {}
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  KEEP_BUILDS: 5
+
+jobs:
+  deploy:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Assemble the site from the releases
+        run: |
+          mkdir -p site/reh site/ors
+          releases=$(gh release list --limit 200 --json tagName,createdAt --jq 'sort_by(.createdAt) | reverse | .[].tagName')
+
+          builds=()
+          for tag in $(echo "${releases}" | grep '^reh-' | head -n "${KEEP_BUILDS}"); do
+            commit="${tag#reh-}"
+            gh release download "${tag}" --dir "site/reh/${commit}"
+            builds+=("${commit}")
+          done
+
+          extension_commit=""
+          ors_tag=$(echo "${releases}" | grep '^ors-' | head -n 1 || true)
+          if [[ -n "${ors_tag}" ]]; then
+            extension_commit="${ors_tag#ors-}"
+            gh release download "${ors_tag}" --dir site/ors
+          fi
+
+          jq -n \
+            --arg latest "${builds[0]:-}" \
+            --arg extension "${extension_commit}" \
+            '{latest: $latest, builds: $ARGS.positional, extension: (if $extension == "" then null else {commit: $extension, url: "ors/open-remote-ssh.vsix"} end)}' \
+            --args "${builds[@]}" > site/builds.json
+
+          {
+            echo '<!doctype html><meta charset="utf-8"><title>ssh-remote-experiment builds</title>'
+            echo '<style>body{font-family:system-ui,sans-serif;max-width:48rem;margin:2rem auto;padding:0 1rem}code{word-break:break-all}</style>'
+            echo '<h1>ssh-remote-experiment builds</h1>'
+            echo '<p>Source: <a href="https://github.com/mmis1000/ssh-remote-experiment">mmis1000/ssh-remote-experiment</a></p>'
+            if [[ -n "${extension_commit}" ]]; then
+              echo "<h2>Open Remote SSH</h2><p><a href=\"ors/open-remote-ssh.vsix\">open-remote-ssh.vsix</a> (<code>${extension_commit}</code>). It downloads the servers below by default.</p>"
+            fi
+            echo '<h2>Remote servers</h2><ul>'
+            for commit in "${builds[@]}"; do
+              for f in site/reh/${commit}/*.tar.gz; do
+                name=$(basename "$f")
+                echo "<li><code>${commit}</code>: <a href=\"reh/${commit}/${name}\">${name}</a></li>"
+              done
+            done
+            echo '</ul>'
+          } > site/index.html
+          cat site/builds.json
+          find site -type f | sort
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4

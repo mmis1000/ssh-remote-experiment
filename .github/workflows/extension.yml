@@ -1,0 +1,61 @@
+# Builds Open Remote SSH with the patches in patches/open-remote-ssh into a VSIX and publishes it as
+# a GitHub release tagged ors-<commit of this repo>. The Pages workflow then serves the latest one at
+#   https://mmis1000.me/ssh-remote-experiment/ors/open-remote-ssh.vsix
+# The patched extension downloads servers from this repo's Pages site by default.
+
+name: Extension
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - patches/open-remote-ssh/**
+      - upstream.env
+      - .github/workflows/extension.yml
+  workflow_dispatch: {}
+
+concurrency:
+  group: extension
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+      # postinstall runs `npx vscode-dts`
+      npm_config_yes: 'true'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Clone Open Remote SSH and apply the patches
+        run: |
+          . ./upstream.env
+          git clone "${OPEN_REMOTE_SSH_REPO}" open-remote-ssh
+          cd open-remote-ssh
+          git checkout "${OPEN_REMOTE_SSH_COMMIT}"
+          git apply ../patches/open-remote-ssh/*.patch
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: open-remote-ssh/.nvmrc
+
+      - name: Build the VSIX
+        working-directory: open-remote-ssh
+        run: |
+          npm ci
+          npm run build
+          npx --yes @vscode/vsce package --no-dependencies --allow-missing-repository -o ../open-remote-ssh.vsix
+
+      - name: Create the release
+        run: |
+          . ./upstream.env
+          gh release create "ors-${GITHUB_SHA}" open-remote-ssh.vsix \
+            --target "${GITHUB_SHA}" \
+            --title "Open Remote SSH ${GITHUB_SHA::7}" \
+            --notes "Open Remote SSH ${OPEN_REMOTE_SSH_COMMIT} with the patches from ${GITHUB_SHA}. It downloads servers from https://mmis1000.me/ssh-remote-experiment by default."

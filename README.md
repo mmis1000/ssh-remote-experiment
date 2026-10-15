@@ -12,30 +12,26 @@ The design is in [PROPOSAL-v2.md](PROPOSAL-v2.md), and the state of the work and
 | Path | What |
 | --- | --- |
 | `patches/vscode/` | The VS Code changes, applied on top of VSCodium's own patches (`git format-patch`). |
-| `patches/open-remote-ssh/` | The Open Remote SSH change (`remote.SSH.devServerCommit`). |
+| `patches/open-remote-ssh/` | The Open Remote SSH changes: `remote.SSH.devServerCommit`, and downloading servers from this repo's Pages site by default. |
 | `upstream.env` | The VSCodium tag and Open Remote SSH commit the patches apply to. |
-| `.github/workflows/server.yml` | Builds the remote server with the patches and publishes it. |
+| `.github/workflows/` | `server.yml` and `extension.yml` build the server and the extension, and `pages.yml` publishes them. |
 | `scripts/` | Local setup: prepare VSCodium, run the dev client, build Open Remote SSH, export patches. |
 | `poc/` | Test tools: drive the dev windows over CDP, inspect and reset the test host. |
 
 `vscodium/` and `open-remote-ssh/` are local clones and are not tracked. After committing in `vscodium/vscode` (branch `persistent-terminals`) or `open-remote-ssh`, run `bash scripts/export-patches.sh` and commit `patches/`.
 
-## Published server
+## Published builds
 
-Each push that changes `patches/vscode/` builds the Linux x64 server and publishes it at
+Everything is served from <https://mmis1000.me/ssh-remote-experiment/>:
 
-```
-https://mmis1000.me/ssh-remote-experiment/reh/<commit>/vscodium-reh-linux-x64.tar.gz
-```
+| Path | What | Built by |
+| --- | --- | --- |
+| `reh/<commit>/vscodium-reh-linux-x64.tar.gz` | The Linux x64 remote server with `patches/vscode`. `<commit>` is the commit of this repo that built it, and the server's product commit. The latest 5 are kept. | `server.yml`, on changes to `patches/vscode/` |
+| `ors/open-remote-ssh.vsix` | Open Remote SSH with `patches/open-remote-ssh`. | `extension.yml`, on changes to `patches/open-remote-ssh/` |
+| `builds.json` | `{ latest, builds, extension }` | `pages.yml` |
 
-`<commit>` is the commit of this repo that built it, and it is also the server's product commit. Builds are listed at <https://mmis1000.me/ssh-remote-experiment/> and in the releases (`reh-<commit>`). The site keeps the latest 5.
+Both build workflows publish GitHub releases (`reh-<commit>`, `ors-<commit>`). `pages.yml` runs after either of them and rebuilds the whole site from the releases.
 
-To use a build from a VSCodium client with the patched Open Remote SSH:
+The patched extension downloads servers from `reh/${commit}/` by default. When the client has no product commit (a client run from source) and `remote.SSH.devServerCommit` is empty, it uses the latest build from `builds.json`. So the dev client needs no extra settings once the extension is installed.
 
-```jsonc
-"remote.SSH.serverDownloadUrlTemplate": "https://mmis1000.me/ssh-remote-experiment/reh/${commit}/vscodium-reh-${os}-${arch}.tar.gz",
-// Only for a client run from source, which has no product commit of its own:
-"remote.SSH.devServerCommit": "<commit>"
-```
-
-The terminal features need the patched client too. For now that means the dev client built from `vscodium/vscode` (see HANDOFF.md).
+The server refuses a client whose commit differs from its own, and the terminal features need the patched client too (window ids, view sizes, the commands). For now that client is the dev build from `vscodium/vscode` (see HANDOFF.md). A stock VSCodium client can't use these servers.

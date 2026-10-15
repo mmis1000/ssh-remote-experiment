@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mmis1000 <mmis10002@gmail.com>
+Date: Thu, 15 Oct 2026 23:18:10 +0800
+Subject: [PATCH 2/2] Default to the ssh-remote-experiment server builds
+
+Download servers from https://mmis1000.me/ssh-remote-experiment by default, and
+when the client has no product commit and remote.SSH.devServerCommit is empty,
+use the latest published build.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ package.json                           |  4 ++--
+ src/server-config/experiment.ts        | 20 ++++++++++++++++++++
+ src/server-config/get-server-config.ts |  4 +++-
+ src/serverSetup.ts                     |  3 ++-
+ 4 files changed, 27 insertions(+), 4 deletions(-)
+ create mode 100644 src/server-config/experiment.ts
+
+diff --git a/package.json b/package.json
+index 9a1e2ba..3eaac18 100644
+--- a/package.json
++++ b/package.json
+@@ -173,13 +173,13 @@
+ 				},
+ 				"remote.SSH.serverDownloadUrlTemplate": {
+ 					"type": "string",
+-					"description": "The URL from where the vscode server will be downloaded. You can use the following variables and they will be replaced dynamically:\n- ${quality}: vscode server quality, e.g. stable or insiders\n- ${version}: vscode server version, e.g. 1.69.0\n- ${commit}: vscode server release commit\n- ${arch}: vscode server arch, e.g. x64, armhf, arm64\n- ${release}: release number, vscodium only https://github.com/VSCodium/vscodium/pull/1192",
++					"description": "The URL from where the vscode server will be downloaded. You can use the following variables and they will be replaced dynamically:\n- ${quality}: vscode server quality, e.g. stable or insiders\n- ${version}: vscode server version, e.g. 1.69.0\n- ${commit}: vscode server release commit\n- ${arch}: vscode server arch, e.g. x64, armhf, arm64\n- ${release}: release number, vscodium only https://github.com/VSCodium/vscodium/pull/1192\n\nDefaults to the builds of https://github.com/mmis1000/ssh-remote-experiment.",
+ 					"scope": "application"
+ 				},
+ 				"remote.SSH.devServerCommit": {
+ 					"type": "string",
+ 					"default": "",
+-					"description": "Server commit to use when the client's product.json has no commit, which is the case for a client run from source. The server must already be installed under that commit on the remote.",
++					"description": "Server commit to use when the client's product.json has no commit, which is the case for a client run from source. When empty, the latest build of https://github.com/mmis1000/ssh-remote-experiment is used.",
+ 					"scope": "application"
+ 				},
+ 				"remote.SSH.remotePlatform": {
+diff --git a/src/server-config/experiment.ts b/src/server-config/experiment.ts
+new file mode 100644
+index 0000000..4134ef6
+--- /dev/null
++++ b/src/server-config/experiment.ts
+@@ -0,0 +1,20 @@
++// Remote servers built by https://github.com/mmis1000/ssh-remote-experiment, which carries the
++// terminal changes this build of the extension is meant for.
++const EXPERIMENT_BASE_URL = 'https://mmis1000.me/ssh-remote-experiment';
++
++/** Download URL of a server build, by the commit that built it (which is also its product commit). */
++export const EXPERIMENT_DOWNLOAD_URL_TEMPLATE = `${EXPERIMENT_BASE_URL}/reh/\${commit}/vscodium-reh-\${os}-\${arch}.tar.gz`;
++
++/** The commit of the latest published server build, or undefined if it can't be fetched. */
++export async function fetchLatestExperimentCommit(): Promise<string | undefined> {
++    try {
++        const response = await fetch(`${EXPERIMENT_BASE_URL}/builds.json`);
++        if (!response.ok) {
++            return undefined;
++        }
++        const builds = await response.json() as { latest?: unknown };
++        return typeof builds.latest === 'string' && /^[0-9a-f]{40}$/.test(builds.latest) ? builds.latest : undefined;
++    } catch {
++        return undefined;
++    }
++}
+diff --git a/src/server-config/get-server-config.ts b/src/server-config/get-server-config.ts
+index 8d61a0c..ec5ff3e 100644
+--- a/src/server-config/get-server-config.ts
++++ b/src/server-config/get-server-config.ts
+@@ -2,6 +2,7 @@ import type { IServerConfig, ServerValidation } from './types';
+ 
+ import * as vscode from 'vscode';
+ import { getProductJson } from './get-product-json';
++import { fetchLatestExperimentCommit } from './experiment';
+ 
+ export async function getServerConfig(): Promise<IServerConfig> {
+     const productJson = await getProductJson();
+@@ -10,10 +11,11 @@ export async function getServerConfig(): Promise<IServerConfig> {
+     const serverValidation = vscode.workspace.getConfiguration('remote.SSH').get<ServerValidation>('serverValidation', 'strict');
+     // A client run from source has no commit in product.json
+     const devServerCommit = vscode.workspace.getConfiguration('remote.SSH').get<string>('devServerCommit', '');
++    const commit = (productJson.commit as string | undefined) || devServerCommit || await fetchLatestExperimentCommit() || '';
+ 
+     return {
+         version: vscode.version.replace('-insider',''),
+-        commit: (productJson.commit as string | undefined) || devServerCommit,
++        commit,
+         quality: productJson.quality as string,
+         release: productJson.release as string || '',
+         serverApplicationName: customServerBinaryName || productJson.serverApplicationName as string,
+diff --git a/src/serverSetup.ts b/src/serverSetup.ts
+index f09485d..aa1e3d5 100644
+--- a/src/serverSetup.ts
++++ b/src/serverSetup.ts
+@@ -6,6 +6,7 @@ import * as path from 'path';
+ import { Log } from './common/logger';
+ import type { SSHClient } from './ssh/sshClient';
+ import { getServerConfig } from './server-config/get-server-config';
++import { EXPERIMENT_DOWNLOAD_URL_TEMPLATE } from './server-config/experiment';
+ import { fetchRelease, IRelease } from './fetchRelease';
+ import { sanitizeExtensionIds } from './utils/sanitize-extension-ids';
+ import { RemotePlatform } from './types';
+@@ -114,7 +115,7 @@ export class ServerInstallError extends Error {
+     }
+ }
+ 
+-const DEFAULT_DOWNLOAD_URL_TEMPLATE = 'https://github.com/VSCodium/vscodium/releases/download/${version}.${release}/vscodium-reh-${os}-${arch}-${version}.${release}.tar.gz';
++const DEFAULT_DOWNLOAD_URL_TEMPLATE = EXPERIMENT_DOWNLOAD_URL_TEMPLATE;
+ 
+ export type Platform = 'alpine' | 'darwin' | 'dragonfly' | 'freebsd' | 'linux' | 'windows';
+ export type Architecture = 'arm64' | 'armhf' | 'loong64' | 'ppc64le' | 'riscv64' | 's390x' | 'x64';
