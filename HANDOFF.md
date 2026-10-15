@@ -29,6 +29,12 @@ Everything is local to this PC and the `nas` host. Nothing is pushed to GitHub, 
 
 Both are pushed to nas and compiled on both sides (gulp, 0 errors).
 
+## Repo and CI
+
+The root folder is the repo `git@github.com:mmis1000/ssh-remote-experiment.git` (public, branch `main`, `core.sshCommand` set to Windows OpenSSH). `vscodium/` and `open-remote-ssh/` are ignored local clones. Their changes are tracked as `patches/` (re-export with `bash scripts/export-patches.sh` after committing in either clone), pinned to the versions in `upstream.env`.
+
+`.github/workflows/server.yml` runs on pushes that change `patches/vscode/`, `upstream.env` or the workflow, and on demand. It clones VSCodium at the tag, copies the patches into `vscodium/patches/user/` (VSCodium applies those last), and runs VSCodium's `build.sh` and `build/linux/package_reh.sh`, the same two jobs as its publish-stable-linux workflow. The server's product commit is the repo commit. It publishes a release `reh-<commit>`, and on Pages (source: GitHub Actions) `https://mmis1000.me/ssh-remote-experiment/reh/<commit>/vscodium-reh-linux-x64.tar.gz` plus `builds.json` and an index, keeping the latest 5. Linux x64 only for now; add rows to the `reh` matrix for more architectures.
+
 ## Build and run
 
 - Node: fnm with 24.18.0 as default; the PowerShell profile loads fnm. Run builds from a real terminal: Claude's sandboxed shell doesn't see fnm's junctions.
