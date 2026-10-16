@@ -1,0 +1,367 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: mmis1000 <mmis10002@gmail.com>
+Date: Fri, 16 Oct 2026 17:40:17 +0800
+Subject: [PATCH 8/8] Terminal menus: lifetime items only where they change
+ something, and Detach
+
+Make Persistent shows only for window-owned targets and Make Window-owned only
+for persistent ones, in the panel tab menus (keys set from the menu's
+terminals when it opens), the terminal editor tab menu (resource in the
+persistent / window-owned resource lists) and the command palette (active
+terminal's lifetime). Detach Session is added to both tab menus and, like the
+lifetime commands, acts on the terminal the menu was opened on.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../contrib/terminal/browser/terminal.ts      |  3 ++
+ .../terminal/browser/terminalActions.ts       | 25 ++++++++++-----
+ .../terminal/browser/terminalContextMenu.ts   | 25 +++++++++++++++
+ .../terminal/browser/terminalInstance.ts      |  3 ++
+ .../contrib/terminal/browser/terminalMenus.ts | 31 ++++++++++++++++---
+ .../terminal/browser/terminalService.ts       | 17 +++++++++-
+ .../contrib/terminal/browser/terminalView.ts  | 13 +++++---
+ .../terminal/common/terminalContextKey.ts     | 20 ++++++++++++
+ 8 files changed, 120 insertions(+), 17 deletions(-)
+
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminal.ts b/src/vs/workbench/contrib/terminal/browser/terminal.ts
+index a825a5de..22a02618 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminal.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminal.ts
+@@ -975,6 +975,9 @@ export interface ITerminalInstance extends IBaseTerminalInstance {
+ 	 */
+ 	readonly lifetime?: ITerminalLifetimeInfo;
+ 
++	/** Fires when {@link lifetime} changes. */
++	readonly onDidChangeLifetime: Event<ITerminalInstance>;
++
+ 	/*
+ 	 * Whether this terminal has been disposed of
+ 	 */
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalActions.ts b/src/vs/workbench/contrib/terminal/browser/terminalActions.ts
+index 5860c85b..87b0970e 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalActions.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalActions.ts
+@@ -230,10 +230,10 @@ export function registerContextualInstanceAction(
+  * provides it to the run function.
+  */
+ /**
+- * The terminals a lifetime command applies to: the tabs the panel's tab menu was opened on, the
+- * terminal of the editor whose tab menu was opened, or else the active terminal.
++ * The terminals a command run from a terminal context menu applies to: the tabs the panel's menu
++ * was opened on, the terminal of the editor whose tab menu was opened, or else the active terminal.
+  */
+-function getLifetimeTargets(c: ITerminalServicesCollection, accessor: ServicesAccessor, args: unknown, allArgs: unknown): ITerminalInstance[] {
++function getMenuTargets(c: ITerminalServicesCollection, accessor: ServicesAccessor, args: unknown, allArgs: unknown): ITerminalInstance[] {
+ 	const selected = getSelectedViewInstances2(accessor, allArgs);
+ 	if (selected) {
+ 		return selected;
+@@ -844,24 +844,35 @@ export function registerTerminalActions() {
+ 		}
+ 	});
+ 
+-	registerActiveInstanceAction({
++	registerTerminalAction({
+ 		id: TerminalCommandId.DetachSession,
+ 		title: localize2('workbench.action.terminal.detachSession', 'Detach Session'),
+-		run: (activeInstance) => activeInstance.detachProcessAndDispose(TerminalExitReason.User)
++		precondition: sharedWhenClause.terminalAvailable,
++		run: async (c, accessor, args, allArgs) => {
++			for (const instance of getMenuTargets(c, accessor, args, allArgs)) {
++				await instance.detachProcessAndDispose(TerminalExitReason.User);
++			}
++		}
+ 	});
+ 
++	// In the command palette only where they change the active terminal; context menus decide
++	// for the terminals they were opened on (see terminalMenus.ts)
+ 	registerTerminalAction({
+ 		id: TerminalCommandId.MakePersistent,
+ 		title: localize2('workbench.action.terminal.makePersistent', 'Make Persistent'),
+ 		precondition: sharedWhenClause.terminalAvailable,
+-		run: (c, accessor, args, allArgs) => setTerminalsLifetime(getLifetimeTargets(c, accessor, args, allArgs), TerminalLifetime.Persistent, accessor)
++		f1: false,
++		menu: { id: MenuId.CommandPalette, when: TerminalContextKeys.activeLifetime.isEqualTo(TerminalLifetime.WindowOwned) },
++		run: (c, accessor, args, allArgs) => setTerminalsLifetime(getMenuTargets(c, accessor, args, allArgs), TerminalLifetime.Persistent, accessor)
+ 	});
+ 
+ 	registerTerminalAction({
+ 		id: TerminalCommandId.MakeWindowOwned,
+ 		title: localize2('workbench.action.terminal.makeWindowOwned', 'Make Window-owned'),
+ 		precondition: sharedWhenClause.terminalAvailable,
+-		run: (c, accessor, args, allArgs) => setTerminalsLifetime(getLifetimeTargets(c, accessor, args, allArgs), TerminalLifetime.WindowOwned, accessor)
++		f1: false,
++		menu: { id: MenuId.CommandPalette, when: TerminalContextKeys.activeLifetime.isEqualTo(TerminalLifetime.Persistent) },
++		run: (c, accessor, args, allArgs) => setTerminalsLifetime(getMenuTargets(c, accessor, args, allArgs), TerminalLifetime.WindowOwned, accessor)
+ 	});
+ 
+ 	registerTerminalAction({
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalContextMenu.ts b/src/vs/workbench/contrib/terminal/browser/terminalContextMenu.ts
+index ccc90305..a7217ec8 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalContextMenu.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalContextMenu.ts
+@@ -10,9 +10,12 @@ import { MarshalledId } from '../../../../base/common/marshallingIds.js';
+ import { SingleOrMany } from '../../../../base/common/types.js';
+ import { getFlatContextMenuActions } from '../../../../platform/actions/browser/menuEntryActionViewItem.js';
+ import { IMenu } from '../../../../platform/actions/common/actions.js';
++import { IContextKey, IContextKeyService } from '../../../../platform/contextkey/common/contextkey.js';
+ import { IContextMenuService } from '../../../../platform/contextview/browser/contextView.js';
++import { TerminalLifetime } from '../../../../platform/terminal/common/terminal.js';
+ import { ITerminalInstance } from './terminal.js';
+ import { ISerializedTerminalInstanceContext } from '../common/terminal.js';
++import { TerminalContextKeys } from '../common/terminalContextKey.js';
+ 
+ /**
+  * A context that is passed to actions as arguments to represent the terminal instance(s) being
+@@ -48,9 +51,31 @@ export class TerminalContextActionRunner extends ActionRunner {
+ 	}
+ }
+ 
++let menuTargetKeys: { persistent: IContextKey<boolean>; windowOwned: IContextKey<boolean> } | undefined;
++
++/** Binds the keys that describe the terminals a context menu acts on; the terminal service calls it once. */
++export function bindTerminalMenuTargetKeys(contextKeyService: IContextKeyService): void {
++	menuTargetKeys = {
++		persistent: TerminalContextKeys.menuTargetsPersistent.bindTo(contextKeyService),
++		windowOwned: TerminalContextKeys.menuTargetsWindowOwned.bindTo(contextKeyService),
++	};
++}
++
++/**
++ * Describes the terminals a context menu is about to act on, so its items can depend on them
++ * (e.g. Make Persistent only for a terminal that isn't). Call it before getting the menu's actions.
++ */
++export function setTerminalMenuTargets(instances: SingleOrMany<ITerminalInstance> | undefined): void {
++	const targets = instances ? asArray(instances) : [];
++	menuTargetKeys?.persistent.set(targets.some(i => i.lifetime?.lifetime === TerminalLifetime.Persistent));
++	menuTargetKeys?.windowOwned.set(targets.some(i => i.lifetime?.lifetime === TerminalLifetime.WindowOwned));
++}
++
+ export function openContextMenu(targetWindow: Window, event: MouseEvent, contextInstances: SingleOrMany<ITerminalInstance> | undefined, menu: IMenu, contextMenuService: IContextMenuService, extraActions?: IAction[]): void {
+ 	const standardEvent = new StandardMouseEvent(targetWindow, event);
+ 
++	setTerminalMenuTargets(contextInstances);
++
+ 	const actions = getFlatContextMenuActions(menu.getActions({ shouldForwardArgs: true }));
+ 
+ 	if (extraActions) {
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts b/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+index c396f135..3e4865a8 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalInstance.ts
+@@ -325,6 +325,8 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
+ 	readonly onWillDispose = this._onWillDispose.event;
+ 	private readonly _onDisposed = this._register(new Emitter<ITerminalInstance>());
+ 	readonly onDisposed = this._onDisposed.event;
++	private readonly _onDidChangeLifetime = this._register(new Emitter<ITerminalInstance>());
++	readonly onDidChangeLifetime = this._onDidChangeLifetime.event;
+ 	private readonly _onProcessIdReady = this._register(new Emitter<ITerminalInstance>());
+ 	readonly onProcessIdReady = this._onProcessIdReady.event;
+ 	private readonly _onProcessReplayComplete = this._register(new Emitter<void>());
+@@ -1654,6 +1656,7 @@ export class TerminalInstance extends Disposable implements ITerminalInstance {
+ 			// Owned by this window, which is what a new terminal is: no marker
+ 			this.statusList.remove(TerminalStatus.Lifetime);
+ 		}
++		this._onDidChangeLifetime.fire(this);
+ 	}
+ 
+ 	private async _createProcess(): Promise<void> {
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalMenus.ts b/src/vs/workbench/contrib/terminal/browser/terminalMenus.ts
+index 07e5b6e0..08e6b3d4 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalMenus.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalMenus.ts
+@@ -591,6 +591,7 @@ export function setupTerminalMenus(): void {
+ 
+ 	MenuRegistry.appendMenuItems(
+ 		[
++			// Lifetime items only where they change something for the terminals the menu is on
+ 			{
+ 				id: MenuId.TerminalTabContext,
+ 				item: {
+@@ -599,7 +600,7 @@ export function setupTerminalMenus(): void {
+ 						title: localize('workbench.action.terminal.makePersistent', "Make Persistent")
+ 					},
+ 					group: TerminalContextMenuGroup.Edit,
+-					when: ContextKeyExpr.notEquals('remoteName', '')
++					when: TerminalContextKeys.menuTargetsWindowOwned
+ 				}
+ 			},
+ 			{
+@@ -610,7 +611,18 @@ export function setupTerminalMenus(): void {
+ 						title: localize('workbench.action.terminal.makeWindowOwned', "Make Window-owned")
+ 					},
+ 					group: TerminalContextMenuGroup.Edit,
+-					when: ContextKeyExpr.notEquals('remoteName', '')
++					when: TerminalContextKeys.menuTargetsPersistent
++				}
++			},
++			{
++				id: MenuId.TerminalTabContext,
++				item: {
++					command: {
++						id: TerminalCommandId.DetachSession,
++						title: localize('workbench.action.terminal.detachSession', "Detach Session")
++					},
++					group: TerminalContextMenuGroup.Edit,
++					when: ContextKeyExpr.or(TerminalContextKeys.menuTargetsPersistent, TerminalContextKeys.menuTargetsWindowOwned)
+ 				}
+ 			},
+ 			{
+@@ -756,12 +768,15 @@ export function setupTerminalMenus(): void {
+ 		when: ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeTerminal),
+ 		group: '2_files'
+ 	});
++	// The tab's terminal is the editor's resource, so these check it against the lifetime lists
++	const editorIsWindowOwned = ContextKeyExpr.and(ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeTerminal), ContextKeyExpr.in(ResourceContextKey.Resource.key, TerminalContextKeys.windowOwnedResources.key));
++	const editorIsPersistent = ContextKeyExpr.and(ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeTerminal), ContextKeyExpr.in(ResourceContextKey.Resource.key, TerminalContextKeys.persistentResources.key));
+ 	MenuRegistry.appendMenuItem(MenuId.EditorTitleContext, {
+ 		command: {
+ 			id: TerminalCommandId.MakePersistent,
+ 			title: localize('workbench.action.terminal.makePersistent', "Make Persistent")
+ 		},
+-		when: ContextKeyExpr.and(ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeTerminal), ContextKeyExpr.notEquals('remoteName', '')),
++		when: editorIsWindowOwned,
+ 		group: '2_files'
+ 	});
+ 	MenuRegistry.appendMenuItem(MenuId.EditorTitleContext, {
+@@ -769,7 +784,15 @@ export function setupTerminalMenus(): void {
+ 			id: TerminalCommandId.MakeWindowOwned,
+ 			title: localize('workbench.action.terminal.makeWindowOwned', "Make Window-owned")
+ 		},
+-		when: ContextKeyExpr.and(ResourceContextKey.Scheme.isEqualTo(Schemas.vscodeTerminal), ContextKeyExpr.notEquals('remoteName', '')),
++		when: editorIsPersistent,
++		group: '2_files'
++	});
++	MenuRegistry.appendMenuItem(MenuId.EditorTitleContext, {
++		command: {
++			id: TerminalCommandId.DetachSession,
++			title: localize('workbench.action.terminal.detachSession', "Detach Session")
++		},
++		when: ContextKeyExpr.or(editorIsWindowOwned, editorIsPersistent),
+ 		group: '2_files'
+ 	});
+ 	MenuRegistry.appendMenuItem(MenuId.EditorTitleContext, {
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalService.ts b/src/vs/workbench/contrib/terminal/browser/terminalService.ts
+index 8c3d3a62..efc99e55 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalService.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalService.ts
+@@ -21,7 +21,7 @@ import { IContextKey, IContextKeyService } from '../../../../platform/contextkey
+ import { IDialogService } from '../../../../platform/dialogs/common/dialogs.js';
+ import { IInstantiationService } from '../../../../platform/instantiation/common/instantiation.js';
+ import { INotificationService } from '../../../../platform/notification/common/notification.js';
+-import { ICreateContributedTerminalProfileOptions, IExtensionTerminalProfile, IPtyHostAttachTarget, IRawTerminalInstanceLayoutInfo, IRawTerminalTabLayoutInfo, IShellLaunchConfig, ITerminalBackend, ITerminalLaunchError, ITerminalLogService, ITerminalsLayoutInfo, ITerminalsLayoutInfoById, TerminalExitReason, TerminalLocation, TerminalSettingId, TitleEventSource } from '../../../../platform/terminal/common/terminal.js';
++import { ICreateContributedTerminalProfileOptions, IExtensionTerminalProfile, IPtyHostAttachTarget, IRawTerminalInstanceLayoutInfo, IRawTerminalTabLayoutInfo, IShellLaunchConfig, ITerminalBackend, ITerminalLaunchError, ITerminalLogService, ITerminalsLayoutInfo, ITerminalsLayoutInfoById, TerminalExitReason, TerminalLocation, TerminalSettingId, TitleEventSource, TerminalLifetime } from '../../../../platform/terminal/common/terminal.js';
+ import { formatMessageForTerminal } from '../../../../platform/terminal/common/terminalStrings.js';
+ import { iconForeground } from '../../../../platform/theme/common/colorRegistry.js';
+ import { getIconRegistry } from '../../../../platform/theme/common/iconRegistry.js';
+@@ -38,6 +38,7 @@ import { TerminalProfileQuickpick } from './terminalProfileQuickpick.js';
+ import { getInstanceFromResource, getTerminalUri, parseTerminalUri } from './terminalUri.js';
+ import { IRemoteTerminalAttachTarget, IStartExtensionTerminalRequest, ITerminalProcessExtHostProxy, ITerminalProfileService } from '../common/terminal.js';
+ import { TerminalContextKeys } from '../common/terminalContextKey.js';
++import { bindTerminalMenuTargetKeys } from './terminalContextMenu.js';
+ import { columnToEditorGroup } from '../../../services/editor/common/editorGroupColumn.js';
+ import { IEditorGroupsService } from '../../../services/editor/common/editorGroupsService.js';
+ import { ACTIVE_GROUP, ACTIVE_GROUP_TYPE, AUX_WINDOW_GROUP, AUX_WINDOW_GROUP_TYPE, IEditorService, SIDE_GROUP, SIDE_GROUP_TYPE } from '../../../services/editor/common/editorService.js';
+@@ -593,6 +594,20 @@ export class TerminalService extends Disposable implements ITerminalService {
+ 			this._terminalCountContextKey.set(this.instances.length);
+ 		};
+ 		this._register(this.onDidChangeInstances(() => updateTerminalContextKeys()));
++
++		// Lifetimes, so the lifetime commands only show where they change something
++		bindTerminalMenuTargetKeys(this._contextKeyService);
++		const activeLifetimeContext = TerminalContextKeys.activeLifetime.bindTo(this._contextKeyService);
++		const persistentResourcesContext = TerminalContextKeys.persistentResources.bindTo(this._contextKeyService);
++		const windowOwnedResourcesContext = TerminalContextKeys.windowOwnedResources.bindTo(this._contextKeyService);
++		const updateLifetimeContextKeys = () => {
++			activeLifetimeContext.set(this.activeInstance?.lifetime?.lifetime ?? '');
++			persistentResourcesContext.set(this.instances.filter(i => i.lifetime?.lifetime === TerminalLifetime.Persistent).map(i => i.resource.toString()));
++			windowOwnedResourcesContext.set(this.instances.filter(i => i.lifetime?.lifetime === TerminalLifetime.WindowOwned).map(i => i.resource.toString()));
++		};
++		this._register(this.createOnInstanceEvent(e => e.onDidChangeLifetime).event(() => updateLifetimeContextKeys()));
++		this._register(this.onDidChangeInstances(() => updateLifetimeContextKeys()));
++		this._register(this.onDidChangeActiveInstance(() => updateLifetimeContextKeys()));
+ 	}
+ 
+ 	async getActiveOrCreateInstance(options?: { acceptsInput?: boolean }): Promise<ITerminalInstance> {
+diff --git a/src/vs/workbench/contrib/terminal/browser/terminalView.ts b/src/vs/workbench/contrib/terminal/browser/terminalView.ts
+index 9530d54a..5887acd7 100644
+--- a/src/vs/workbench/contrib/terminal/browser/terminalView.ts
++++ b/src/vs/workbench/contrib/terminal/browser/terminalView.ts
+@@ -48,7 +48,7 @@ import { Event } from '../../../../base/common/event.js';
+ import { IHoverDelegate, IHoverDelegateOptions } from '../../../../base/browser/ui/hover/hoverDelegate.js';
+ import { IHoverService } from '../../../../platform/hover/browser/hover.js';
+ import { IAccessibilityService } from '../../../../platform/accessibility/common/accessibility.js';
+-import { InstanceContext, TerminalContextActionRunner } from './terminalContextMenu.js';
++import { InstanceContext, setTerminalMenuTargets, TerminalContextActionRunner } from './terminalContextMenu.js';
+ import { MicrotaskDelay } from '../../../../base/common/symbols.js';
+ import { IStorageService } from '../../../../platform/storage/common/storage.js';
+ import { hasNativeContextMenu } from '../../../../platform/window/common/window.js';
+@@ -279,8 +279,11 @@ export class TerminalViewPane extends ViewPane {
+ 			}
+ 			case TerminalCommandId.Focus: {
+ 				if (action instanceof MenuItemAction) {
+-					const actions = getFlatContextMenuActions(this._singleTabMenu.getActions({ shouldForwardArgs: true }));
+-					const item = this._instantiationService.createInstance(SingleTerminalTabActionViewItem, action, actions);
++					const getActions = () => {
++						setTerminalMenuTargets(this._terminalGroupService.activeInstance);
++						return getFlatContextMenuActions(this._singleTabMenu.getActions({ shouldForwardArgs: true }));
++					};
++					const item = this._instantiationService.createInstance(SingleTerminalTabActionViewItem, action, getActions);
+ 					this._actionDisposables.set(action.id, item);
+ 					return item;
+ 				}
+@@ -410,7 +413,7 @@ class SingleTerminalTabActionViewItem extends MenuEntryActionViewItem {
+ 
+ 	constructor(
+ 		action: MenuItemAction,
+-		private readonly _actions: IAction[],
++		private readonly _getActions: () => IAction[],
+ 		@IKeybindingService keybindingService: IKeybindingService,
+ 		@INotificationService notificationService: INotificationService,
+ 		@IContextKeyService contextKeyService: IContextKeyService,
+@@ -554,7 +557,7 @@ class SingleTerminalTabActionViewItem extends MenuEntryActionViewItem {
+ 		this._contextMenuService.showContextMenu({
+ 			actionRunner,
+ 			getAnchor: () => this.element!,
+-			getActions: () => this._actions,
++			getActions: () => this._getActions(),
+ 			// The context is always the active instance in the terminal view
+ 			getActionsContext: () => {
+ 				const instance = this._terminalGroupService.activeInstance;
+diff --git a/src/vs/workbench/contrib/terminal/common/terminalContextKey.ts b/src/vs/workbench/contrib/terminal/common/terminalContextKey.ts
+index 82b0adcf..556c9fa6 100644
+--- a/src/vs/workbench/contrib/terminal/common/terminalContextKey.ts
++++ b/src/vs/workbench/contrib/terminal/common/terminalContextKey.ts
+@@ -36,6 +36,11 @@ export const enum TerminalContextKeyStrings {
+ 	FindInputFocused = 'terminalFindInputFocused',
+ 	FindFocused = 'terminalFindFocused',
+ 	TabsSingularSelection = 'terminalTabsSingularSelection',
++	ActiveLifetime = 'terminalActiveLifetime',
++	PersistentResources = 'terminalPersistentResources',
++	WindowOwnedResources = 'terminalWindowOwnedResources',
++	MenuTargetsPersistent = 'terminalMenuTargetsPersistent',
++	MenuTargetsWindowOwned = 'terminalMenuTargetsWindowOwned',
+ 	SplitTerminal = 'terminalSplitTerminal',
+ 	SplitPaneActive = 'terminalSplitPaneActive',
+ 	ShellType = 'terminalShellType',
+@@ -132,6 +137,21 @@ export namespace TerminalContextKeys {
+ 	/** Whether the focused tab's terminal is a split terminal. */
+ 	export const splitTerminalTabFocused = new RawContextKey<boolean>(TerminalContextKeyStrings.SplitTerminal, false, localize('isSplitTerminalContextKey', "Whether the focused tab's terminal is a split terminal."));
+ 
++	/** The lifetime the pty host manages for the active terminal: 'persistent', 'windowOwned' or ''. */
++	export const activeLifetime = new RawContextKey<string>(TerminalContextKeyStrings.ActiveLifetime, '', localize('terminalActiveLifetimeContextKey', "The lifetime of the active terminal: persistent, windowOwned, or empty when it has none."));
++
++	/** Resources of the terminals with a persistent lifetime, for `resource in` checks in editor menus. */
++	export const persistentResources = new RawContextKey<string[]>(TerminalContextKeyStrings.PersistentResources, [], true);
++
++	/** Resources of the terminals with a window-owned lifetime, for `resource in` checks in editor menus. */
++	export const windowOwnedResources = new RawContextKey<string[]>(TerminalContextKeyStrings.WindowOwnedResources, [], true);
++
++	/** Whether a terminal the open context menu acts on is persistent. */
++	export const menuTargetsPersistent = new RawContextKey<boolean>(TerminalContextKeyStrings.MenuTargetsPersistent, false, true);
++
++	/** Whether a terminal the open context menu acts on is window-owned. */
++	export const menuTargetsWindowOwned = new RawContextKey<boolean>(TerminalContextKeyStrings.MenuTargetsWindowOwned, false, true);
++
+ 	/** Whether the active terminal is a split pane */
+ 	export const splitTerminalActive = new RawContextKey<boolean>(TerminalContextKeyStrings.SplitPaneActive, false, localize('splitPaneActive', "Whether the active terminal is a split pane."));
+ 
